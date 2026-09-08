@@ -3,14 +3,64 @@
 Base URL: `https://api.rating.chgk.info`
 
 The API is built on API Platform (Symfony) and exposes both a plain JSON
-representation (default) and a JSON-LD / Hydra representation. There is
-**no** Swagger UI / `openapi.json` reachable on this host. The discoverable
-spec is the Hydra documentation at:
+representation (default) and a JSON-LD / Hydra representation. The OpenAPI
+3.1 document is served from `/docs`, but only under its own MIME type
+(anything else is a 404/406):
 
 ```
-GET https://api.rating.chgk.info/docs.jsonld
-Accept: application/ld+json
+GET https://api.rating.chgk.info/docs
+Accept: application/vnd.openapi+json
 ```
+
+The Hydra documentation is at `/docs.jsonld` with `Accept:
+application/ld+json`.
+
+## Authentication — what the spec says vs. what works
+
+The OpenAPI document declares `bearerAuth` (JWT) on **all 56 operations**,
+so its security flags carry no information. Probed anonymously on
+2026-09-04: **every `GET` answers 200** except `/users/test` (401). The
+token endpoint `POST /authentication_token` exists (an empty body gets
+400, not 404), but it is not usable for our accounts, and the spec's
+`POST`/`PATCH`/`DELETE` operations (create/edit players, teams, venues,
+countries, seasons, venue types) are not usable either. Writes go
+through the website with cookie sessions: roster/results use its separate
+JSON endpoints (see `submission_api.md`); creation uses forms (`har_notes.md`).
+
+## Endpoint coverage (anonymous GETs) → `ApiClient`
+
+| Endpoint | Method |
+|---|---|
+| `/players/{id}` | `get_player` |
+| `/players?surname&name` | `search_players`, `find_players` |
+| `/players/{id}/seasons` | `get_player_seasons` |
+| `/players/{id}/tournaments` | `get_player_tournaments` |
+| `/teams/{id}` | `get_team` |
+| `/teams?name` | `search_teams`, `find_teams` |
+| `/teams/{id}/seasons` | `get_team_seasons`, `get_base_roster` |
+| `/teams/{id}/tournaments` | `get_team_tournaments` |
+| `/towns?name`, `/towns/{id}` | `search_towns`, `lookup_town_id`, `get_town` |
+| `/countries?name`, `/countries/{id}` | `search_countries`, `lookup_country` (both return `Country { id, name }`), `get_country` |
+| `/regions` | `list_regions` |
+| `/venues?name`, `/venues/{id}` | `search_venues`, `get_venue` (`get_venue_town` is deprecated) |
+| `/venues/{id}/requests` | `get_venue_requests`, `list_synch_tournaments_for_venue` |
+| `/venue_types` | `list_venue_types` |
+| `/tournaments` (filters below) | `search_tournaments` |
+| `/tournaments/{id}` | `get_tournament` |
+| `/tournaments/{id}/requests` | `get_tournament_requests` |
+| `/tournaments/{id}/results` | `get_tournament_results`, `get_tournament_results_with`, `get_tournament_controversials` |
+| `/tournaments/{id}/appeals` | `get_tournament_appeals` |
+| `/tournaments/{id}/intersections` | `get_tournament_intersections` |
+| `/tournament_synch_requests/{id}` | `get_synch_request` |
+| `/tournament_synch_controversials/{id}` | `get_controversial` |
+| `/tournament_team_flags` | `list_team_flags` |
+| `/seasons`, `/seasons/{id}` | `list_seasons`, `get_season` |
+| `/releases`, `/releases/{id}` | `list_releases`, `get_release` |
+| `/languages` | `list_languages` |
+| `/users`, `/users/{id}` | not wrapped on purpose (the user table, anonymously readable) |
+| `/tournament_synch_appeals/{id}` | not wrapped: `/tournaments/{id}/appeals` returns the same records for a whole tournament |
+| `/regions/{id}`, `/languages/{id}`, `/venue_types/{id}`, `/tournament_team_flags/{id}` | not wrapped; the list endpoints cover them |
+| `/synch_tournaments`, `/regular_tournaments`, `/merger_tournaments` | not in the OpenAPI document (legacy paths); `/tournaments` covers them |
 
 The entrypoint listing all collections is:
 
@@ -41,7 +91,7 @@ Accept: application/ld+json
   }
   ```
   Use this representation when you need `totalItems` or want to jump to the
-  last page (handy because ordering parameters are silently ignored — see
+  last page of a request list (those have no ordering parameter — see
   below).
 
 ## Pagination
@@ -52,38 +102,52 @@ Accept: application/ld+json
 * For total count and last-page URL, request with `Accept:
   application/ld+json` and read `totalItems` / `view.last`.
 
-## Ordering — IMPORTANT CAVEAT
+## Ordering
 
-`order[field]=asc|desc` query parameters are **silently ignored** on every
-endpoint that was tested (`/synch_tournaments`, `/tournaments`, `/teams`,
-`/venues/{id}/requests`, `/tournaments/{id}/requests`). The collection is
-always returned in ascending primary-key (`id`) order.
+Default order is ascending primary key (`id`). The `order[...]`
+parameters the spec advertises **do work** (re-verified 2026-09-04;
+earlier versions of these notes said they were ignored):
 
-To get newest-first you must either:
+* `/tournaments?order[id]=desc` and `order[lastEditDate]`;
+* `/teams?order[name]=asc|desc` and `order[tournamentsPlayedB]`.
 
-1. Fetch with `Accept: application/ld+json`, read `view.last`, then walk
-   pages backwards (`page=last_page, last_page-1, ...`), reversing each
-   page's contents in the client; **or**
-2. Fetch all and sort client-side.
+The request lists (`/venues/{id}/requests`, `/tournaments/{id}/requests`)
+have no ordering parameter; they are always ascending by id. To get a
+venue's newest requests either filter with `dateStart[after]` or fetch
+all and sort client-side (what `list_synch_tournaments_for_venue` does).
 
-## Filtering — IMPORTANT CAVEAT
+## Filtering
 
-Filter query parameters using API Platform's usual `field=value`,
-`field.subfield=value`, or `dateStart[after]=...` syntax are **silently
-ignored** on the tested collection endpoints, with **two exceptions**:
+The filters the spec advertises **do work** (re-verified 2026-09-04;
+earlier versions of these notes said most were ignored). `itemsPerPage`
+is honoured everywhere.
 
-* `/teams?name=<fragment>` — works (case-insensitive substring match).
-* The dedicated subresource paths described below act as filters by their
-  parent ID (e.g. `/venues/{id}/requests`).
+* Name filters — `/teams?name`, `/players?surname[&name]`, `/towns?name`,
+  `/countries?name`, `/venues?name`, `/tournaments?name` — are
+  **case-insensitive substring** matches (Cyrillic and Latin alike);
+  `/players?surname=михайлюк` finds `Михайлюк`, `/venues?name=ако` finds
+  `Балаково` and `Краков`. An unmatched name returns `[]`.
+* `/tournaments`: `type` (2 очник, 3 синхрон, 6 строгий синхрон,
+  8 асинхрон), `archive`, `dateStart[after|before|strictly_*]`,
+  `dateEnd[...]`, `lastEditDate[...]`, `language`, `town`,
+  `town.region`, `town.country`, `editor`, `ratingSystems`.
+* `/teams`: `id[]` (several ids at once), `town`, `town.country`,
+  `town.region`.
+* `/towns`: `country`, `region`; `/regions`: `country`.
+* `/venues/{id}/requests`, `/tournaments/{id}/requests`:
+  `dateStart[...]`, `issuedAt[...]`.
+* `/teams/{id}/seasons`, `/players/{id}/seasons`: `idseason`, `idplayer`,
+  `idteam` (single or `[]`).
+* `/tournaments/{id}/results`: see the results section.
 
-So filtering `synch_tournaments` by venue does not work — you must walk the
-venue's request subresource instead.
+There is still **no venue filter on `/tournaments`** — a venue's
+tournaments come from `/venues/{id}/requests`.
 
 ---
 
 ## 1. Synchronous tournaments held at a specific venue (newest first)
 
-### Endpoint (do NOT try to filter `/synch_tournaments`)
+### Endpoint (`/tournaments` has no venue filter)
 
 ```
 GET /venues/{venueId}/requests?page={N}&itemsPerPage={K}
@@ -128,7 +192,7 @@ GET /venues/3030/requests?itemsPerPage=2
 
 #### Reverse-chronological listing
 
-`order[dateStart]=desc` is ignored. The list is in ascending request `id`,
+There is no `order[...]` parameter on this endpoint. The list is in ascending request `id`,
 which (because requests are filed in time order) is *almost* — but not
 strictly — chronological by `dateStart`. The clean approach is:
 
@@ -140,8 +204,11 @@ strictly — chronological by `dateStart`. The clean approach is:
    strict order (request `id` ordering and `dateStart` ordering can differ
    for the same venue).
 
-There is no server-side date range filter that was found to work; do
-date-window filtering client-side after fetching.
+`dateStart[after|before|strictly_after|strictly_before]` and
+`issuedAt[...]` filters work here (verified 2026-09-04), so a recent window
+can be requested directly; `list_synch_tournaments_for_venue` fetches all
+pages and sorts client-side instead because it wants the newest 100
+regardless of date.
 
 #### Pagination
 
@@ -216,13 +283,16 @@ tournaments you can equivalently `GET /synch_tournaments/{id}` (verified
 
 ### `questionQty` shape (load-bearing for the deserializer)
 
-`questionQty` is a **JSON object whose keys are stringified round numbers
-("1", "2", ...) and whose values are integer question counts**. It is
-**not** an array. Number of rounds = `len(questionQty)`. For tournament
-9700: `{"1":12,"2":12,"3":12}` => 3 rounds, 12 questions each.
+`questionQty` comes in **two shapes**: usually a JSON object whose keys are
+stringified round numbers ("1", "2", ...) and whose values are integer
+question counts — for tournament 9700: `{"1":12,"2":12,"3":12}` => 3
+rounds, 12 questions each — but a plain array (`[12, 12, 12]`) has also
+been observed (PHP serialises a list with consecutive 0-based keys as an
+array). `api.rs::parse_question_qty` accepts both and sorts object keys
+numerically. Number of rounds = number of entries.
 
-For very old tournaments (e.g. id=1, year 2003) the field may be entirely
-absent. Treat it as `Option<BTreeMap<String, u32>>` (or similar) in Rust.
+For very old tournaments (e.g. id=1, year 2003) the field is `null` /
+absent (verified 2026-09-03).
 
 ### Other tournament fields seen in the wild
 
@@ -425,13 +495,56 @@ existence check for a configured `venue_id`.
 
 ---
 
+## Tournament results (`/tournaments/{id}/results`)
+
+`GET /tournaments/{id}/results` returns one row per team (all venues of a
+synchronous tournament together). Query parameters (all verified
+2026-09-04): `includeMasksAndControversials=1` adds `mask` and
+`controversials`; `includeTeamMembers=1` adds `teamMembers` (player,
+flag `К`/`Б`/`Л`, individual rating); `includeTeamFlags=1` adds `flags`
+(short names of the зачёты); `includeRatingB=1` adds a `rating` object;
+`venue`, `town`, `region`, `country`, `flag` (single or `[]`) filter the
+rows. Sample row for tournament 14015, captured 2026-09-03 while the
+results were **not yet published**:
+
+```json
+{
+  "team": { "id": 86732, "name": "4:20", "town": { "id": 2088, "name": "Краков" } },
+  "current": { "name": "4:20", "town": { "id": 2088, "name": "Краков" } },
+  "mask": null,
+  "questionsTotal": null,
+  "position": null,
+  "synchRequest": { "id": 189504, "venue": { "id": 3360, "name": "Краков" }, "tournamentId": 14015 },
+  "controversials": []
+}
+```
+
+* `mask` — `"110101…"`, one character per question across all rounds, in
+  order. `null` until the tournament is past `dateDownloadQuestionsFrom`.
+* `questionsTotal` (correct answers; a float in JSON) and `position` (ties
+  give fractional values) — `null` until the results are published.
+* `synchRequest` — absent for non-synchronous tournaments; its `venue.id`
+  is how rows are attributed to a venue.
+* `controversials` — full records: `{"id": 215378, "questionNumber": 26,
+  "answer": "…", "issuedAt": …, "status": "D", "comment": null,
+  "resolvedAt": null, "appealJuryComment": null}`; `status` is `A`
+  (accepted), `D` (declined), otherwise pending. The same record is at
+  `/tournament_synch_controversials/{id}`.
+* `team.name` is the registered name; `current` is the team's present
+  name/town (`current.name` is exposed as `TournamentResult::current_name`).
+
+`/tournaments/{id}/results` for a nonexistent id is `404`.
+
+---
+
 ## Quick Rust deserialization hints
 
 * All datetimes are ISO-8601 with explicit offset (`+03:00`, `+04:00`,
   etc.). Use `chrono::DateTime<chrono::FixedOffset>` and call
   `.with_timezone(&Utc)` if you want UTC.
-* `questionQty` => `Option<std::collections::BTreeMap<String, u32>>`. The
-  string keys are decimal round numbers but are quoted in JSON.
+* `questionQty` => deserialise as `Option<serde_json::Value>` and accept
+  both the object form (string keys = decimal round numbers) and the array
+  form; see the tournament section above.
 * Player surnames sometimes have an optional `patronymic`; `gotQuestionsTag`
   is also optional. Make those `Option<...>`.
 * `Town`, `Region`, `Country` are deeply nested but uniform — define one
@@ -446,16 +559,43 @@ existence check for a configured `venue_id`.
 * `tournament_synch_requests` resource id (the `id` field) is unique and
   globally addressable at `/tournament_synch_requests/{id}`.
 
+## Other endpoints (shapes, verified 2026-09-04)
+
+* `/tournaments/{id}` full object: `type` is an **object**
+  `{"id": 3, "name": "Синхрон", "shortName": "С"}` (the spec says
+  integer), plus `longName`, `dateEnd`, `lastEditDate`, `idseason`,
+  `editors` / `gameJury` / `appealJury` (player objects), `languages`
+  (`[{"id": "ru", "name": …}]`), `ratingSystems`, `archive`,
+  `dateDownloadQuestionsFrom`, `dateRequestsAllowedTo`,
+  `dateAppealAllowedTo`, `hideResultsTo`, `hideQuestionsTo`,
+  `difficultyForecast`, `regulationsUrl`, `synchData`, `paymentCategories`.
+* `/tournament_synch_requests/{id}` and the request lists: `{"id",
+  "status" (A approved, N new, C cancelled, D declined), "venue" {…with
+  town and type}, "representative" {player}, "narrator" {player} | null,
+  "approximateTeamsCount", "issuedAt", "dateStart", "tournamentId"}`.
+* `/tournaments/{id}/appeals`: `{"id", "idtournament", "type", "issuedAt",
+  "status", "appeal", "comment", "answer", "questionNumber",
+  "overriddenById"}`.
+* `/teams/{id}/tournaments`: `{"idteam", "idtournament"}`, unpaginated
+  (205 rows for team 86732 in one response). `/players/{id}/tournaments`:
+  `{"idplayer", "idteam", "idtournament"}`, unpaginated.
+* `/teams/{id}/seasons`, `/players/{id}/seasons`: `{"idplayer",
+  "idseason", "idteam", "dateAdded", "dateRemoved", "playerNumber"}`,
+  paginated.
+* `/seasons` (47 rows, unpaginated; ids run into the future),
+  `/releases` (paginated), `/languages` (`{"id": "ru", "name", "value"}`,
+  unpaginated), `/venue_types` (4 rows), `/tournament_team_flags`
+  (`{"id", "name": "SCHOOL", "value", "fullName", "shortName"}`, 58 rows in
+  one unpaginated response),
+  `/regions` (paginated, `country` nested).
+* `/intersections`: tournaments sharing questions, as full tournament
+  objects.
+
 ## What is *guessed* / not 100% verified
 
 * The exact maximum allowed `itemsPerPage`. 100 works, larger values were
   not probed.
-* Whether `name=` on `/teams` is strictly substring vs. some token-based
-  match. All probed examples behave like a case-insensitive substring on
-  `name`.
-* Whether any hidden ordering / filter params exist that the Hydra docs
-  don't advertise — none found among the obvious API Platform conventions
-  (`order[...]`, `dateStart[after|before]`, `field=`, `field.id=`).
+* `includeRatingB` output and `synchData` were seen but not modelled.
 * `regular_tournaments` and `merger_tournaments` collections exist but
   were not probed; for *reading* an arbitrary tournament prefer the
   unified `/tournaments/{id}` endpoint.

@@ -1,23 +1,72 @@
-//! Row types and CSV builders for the site's roster and results importers.
+//! Row types for site submissions, plus optional legacy CSV export builders.
 //! Formats follow the rating.chgk.info admin documentation; see
 //! `docs/har_notes.md` §4–5 for what the site actually does with them.
+//!
+//! Cells are quoted per RFC 4180 when they contain a comma, a quote or a
+//! line break. Values starting with `=`, `+`, `-` or `@` are passed through
+//! untouched: the site's importer is not a spreadsheet UI, and real team
+//! names begin with such characters. Applications that also write these
+//! CSVs to disk for people to open in a spreadsheet must neutralise those
+//! prefixes themselves.
 
 use std::collections::BTreeMap;
+
+/// A player's role on a roster row (the `признак` column).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RosterFlag {
+    /// `К` — captain.
+    Captain,
+    /// `Б` — base squad. Claims the player as a permanent member of the
+    /// team; use only when that is known to be true.
+    Base,
+    /// `Л` — legionnaire.
+    Legionnaire,
+}
+
+impl RosterFlag {
+    /// The flag for the site's single-letter code, `None` for anything
+    /// else (including an empty cell).
+    pub fn from_char(c: char) -> Option<RosterFlag> {
+        match c {
+            'К' => Some(RosterFlag::Captain),
+            'Б' => Some(RosterFlag::Base),
+            'Л' => Some(RosterFlag::Legionnaire),
+            _ => None,
+        }
+    }
+
+    /// The single-letter code the importer expects.
+    pub fn as_char(self) -> char {
+        match self {
+            RosterFlag::Captain => 'К',
+            RosterFlag::Base => 'Б',
+            RosterFlag::Legionnaire => 'Л',
+        }
+    }
+}
 
 /// One player on one team, both keyed by rating.chgk.info ids.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RosterRow {
+    /// The site's numeric team id.
     pub team_id: i64,
+    /// Team name as it should appear for this tournament.
     pub team_name: String,
+    /// Town name (string, not id).
     pub town: String,
+    /// The site's numeric player id.
     pub player_id: i64,
+    /// Surname.
     pub surname: String,
+    /// Given name.
     pub name: String,
+    /// Patronymic, or empty.
     pub patronymic: String,
-    /// `К` (captain), `Б` (base squad), `Л` (legionnaire), or `None` when
-    /// not tracked. Marking a player `Б` claims them as a permanent member
-    /// of the team — leave it empty unless that is known to be true.
-    pub flag: Option<char>,
+    /// The player's role. JSON roster submission preserves `Some(flag)`;
+    /// for `None`, it derives base/legionnaire from membership in the team's
+    /// base roster in the tournament's season at the tournament's end date.
+    /// The standalone CSV builder writes `None` as an empty cell.
+    pub flag: Option<RosterFlag>,
 }
 
 /// `idteam,команда,город,признак (К|Б|Л),idplayer,Ф,И,О` — one row per
@@ -30,7 +79,7 @@ pub fn build_rosters_csv(rows: &[RosterRow]) -> String {
             r.team_id,
             escape(&r.team_name),
             escape(&r.town),
-            r.flag.map(|c| c.to_string()).unwrap_or_default(),
+            r.flag.map(|f| f.as_char().to_string()).unwrap_or_default(),
             r.player_id,
             escape(&r.surname),
             escape(&r.name),
@@ -43,7 +92,9 @@ pub fn build_rosters_csv(rows: &[RosterRow]) -> String {
 /// A team's mark for one question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mark {
+    /// Answered correctly (`1`).
     Correct,
+    /// Answered wrongly (`0`).
     Wrong,
     /// Contested ("спорный"): the cell carries the disputed answer text
     /// from [`ResultsRoundRow::controversials`], or `?` when there is none.
@@ -55,12 +106,16 @@ pub enum Mark {
 /// One team's marks for one round.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultsRoundRow {
+    /// The site's numeric team id.
     pub team_id: i64,
+    /// Team name as played in this tournament.
     pub team_name: String,
+    /// Town name for CSV export; JSON results submission uses the saved team.
     pub town: String,
     /// 1-based round number.
     pub round: u32,
-    /// One entry per question of the round, in order.
+    /// One entry per question of the round, in order. JSON submission requires
+    /// exactly the configured number of questions for every supplied round.
     pub marks: Vec<Mark>,
     /// For [`Mark::Contested`] cells: index into `marks` → disputed answer.
     pub controversials: BTreeMap<usize, String>,
@@ -100,7 +155,7 @@ pub fn build_results_csv(rows: &[ResultsRoundRow]) -> String {
 /// does not match the registered one — see
 /// [`crate::site::sanitize_roster_rows`].
 pub fn escape(s: &str) -> String {
-    if s.contains(',') || s.contains('"') || s.contains('\n') {
+    if s.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
         s.to_string()
@@ -111,7 +166,7 @@ pub fn escape(s: &str) -> String {
 mod tests {
     use super::*;
 
-    fn row(team_id: i64, team_name: &str, player_id: i64, flag: Option<char>) -> RosterRow {
+    fn row(team_id: i64, team_name: &str, player_id: i64, flag: Option<RosterFlag>) -> RosterRow {
         RosterRow {
             team_id,
             team_name: team_name.into(),
@@ -130,17 +185,41 @@ mod tests {
         assert_eq!(escape("has, comma"), "\"has, comma\"");
         assert_eq!(escape("has \"quote\""), "\"has \"\"quote\"\"\"");
         assert_eq!(escape("line\nfeed"), "\"line\nfeed\"");
+        assert_eq!(escape("carriage\rreturn"), "\"carriage\rreturn\"");
+    }
+
+    #[test]
+    fn empty_input_builds_empty_csv() {
+        assert_eq!(build_rosters_csv(&[]), "");
+        assert_eq!(build_results_csv(&[]), "");
+    }
+
+    #[test]
+    fn roster_flags_map_to_the_importer_letters() {
+        assert_eq!(RosterFlag::Captain.as_char(), 'К');
+        assert_eq!(RosterFlag::Base.as_char(), 'Б');
+        assert_eq!(RosterFlag::Legionnaire.as_char(), 'Л');
+        assert_eq!(RosterFlag::from_char('Б'), Some(RosterFlag::Base));
+        assert_eq!(RosterFlag::from_char('x'), None);
     }
 
     #[test]
     fn rosters_csv_shape() {
         let rows = vec![
             row(86732, "4:20", 19541, None),
-            row(107740, "\"Ладно, погнали втроём сегодня\"", 29516, Some('К')),
+            row(
+                107740,
+                "\"Ладно, погнали втроём сегодня\"",
+                29516,
+                Some(RosterFlag::Captain),
+            ),
         ];
         let csv = build_rosters_csv(&rows);
         let lines: Vec<&str> = csv.lines().collect();
-        assert_eq!(lines[0], "86732,4:20,Краков,,19541,Малкин,Михаил,Леонидович");
+        assert_eq!(
+            lines[0],
+            "86732,4:20,Краков,,19541,Малкин,Михаил,Леонидович"
+        );
         assert_eq!(
             lines[1],
             "107740,\"\"\"Ладно, погнали втроём сегодня\"\"\",Краков,К,29516,Малкин,Михаил,Леонидович"
@@ -156,7 +235,13 @@ mod tests {
             team_name: "Прокрастинация".into(),
             town: "Berlin".into(),
             round: 1,
-            marks: vec![Mark::Correct, Mark::Wrong, Mark::Contested, Mark::Blank, Mark::Contested],
+            marks: vec![
+                Mark::Correct,
+                Mark::Wrong,
+                Mark::Contested,
+                Mark::Blank,
+                Mark::Contested,
+            ],
             controversials,
         }];
         assert_eq!(

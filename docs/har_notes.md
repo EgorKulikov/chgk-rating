@@ -1,10 +1,18 @@
 # rating.chgk.info Write-Side HAR Reference
 
-Canonical reference for the Rust client that drives the **admin website** at
+Historical form reference for the Rust client that drives the **admin website** at
 `https://rating.chgk.info` (NOT the read-only `api.rating.chgk.info`).
 
-All HARs in this folder were captured with Chrome DevTools while driving the
-site as a logged-in administrator. **Chrome strips `Cookie` request headers
+Roster/results submission now uses the website's JSON endpoints described in
+`submission_api.md`. The CSV import and fix-form sections below document the
+old workflow and the optional CSV helpers; they no longer describe
+`SiteClient::upload_rosters` or `SiteClient::upload_results`.
+
+The HAR captures this document is based on live in the `chgk_local`
+project (they are not shipped with this crate — they contain a live
+session). They were captured with Chrome DevTools while driving the site as
+a logged-in administrator; later behaviour was verified by probing with the
+client itself (dates noted inline). **Chrome strips `Cookie` request headers
 and `Set-Cookie` response headers from HAR exports**, so the specific cookie
 names aren't directly observable from the captures — they have to be
 re-discovered empirically at runtime (see the Session/Cookie section).
@@ -93,7 +101,7 @@ Headers (relevant):
 Body (form-encoded, verbatim from HAR):
 
 ```
-_csrf_token=<csrf token>&_username=egor%40egork.net&_password=<redacted>&_remember_me=on&go=%D0%92%D1%85%D0%BE%D0%B4
+_csrf_token=<csrf token>&_username=%3Cadmin%20e-mail%3E&_password=<redacted>&_remember_me=on&go=%D0%92%D1%85%D0%BE%D0%B4
 ```
 
 Fields:
@@ -101,7 +109,7 @@ Fields:
 | Name | Value | Notes |
 |---|---|---|
 | `_csrf_token` | opaque string | Scraped from `GET /login` hidden input. |
-| `_username` | `egor@egork.net` (URL-encoded) | The admin's email. |
+| `_username` | `<admin e-mail>` (URL-encoded) | The account's login e-mail. |
 | `_password` | cleartext | (The real value is in the HAR; rotate it.) |
 | `_remember_me` | `on` | Required for the `REMEMBERME` cookie. |
 | `go` | `Вход` (URL-encoded as `%D0%92%D1%85%D0%BE%D0%B4`) | Submit button; Symfony doesn't care but some setups do. Safe to include. |
@@ -115,7 +123,7 @@ post-login `GET /` in the HAR confirms login via the presence of these
 elements:
 
 ```html
-<span class="no-display" id="rt_user_email">egor@egork.net</span>
+<span class="no-display" id="rt_user_email">&lt;admin e-mail&gt;</span>
 <span class="no-display" id="rt_user_idplayer">17230</span>
 <a class="dropdown-item" href="/logout">Выход</a>
 ```
@@ -222,6 +230,10 @@ Response: `200 application/json`, body **exactly**:
 ```
 
 Same gotcha as `create_player`: the server does not return the new team id.
+
+**Unresolved:** the client (`SiteClient::create_team`) requires
+`{"success":true}` like `create_player` does, which contradicts the `[]`
+above. One of the two is stale; re-probe before relying on the error.
 Plan on a follow-up lookup (likely `api.rating.chgk.info/teams?name=...`).
 
 ---
@@ -289,8 +301,10 @@ three shapes —
    So the CSV parser is fine (PhpSpreadsheet — an unreadable file yields
    the visible `Ошибка импорта: Unable to read data from {$pFilename}`);
    the fix-form path crashes on quotes. One bad row kills the whole file.
-   Hence `site_safe_teams` strips quotes only for names that differ from
-   the registered one, and `upload_rosters` treats shape 3 as an error.
+   Hence `sanitize_roster_rows` strips quotes only for names that differ
+   from the registered one, and `upload_rosters` treats shape 3 as an
+   error. A fourth shape — a visible `Ошибка импорта: …` line, e.g. for an
+   unreadable file — is reported as `Error::Site` with that text.
 
 ### 4.2 Step B — confirm / resolve duplicates (captured)
 
@@ -340,7 +354,7 @@ Top-level fields:
 |---|---|---|
 | `idimport` | `192317` | **Opaque server-allocated import id** — returned in the HTML of step A. The Rust client must scrape it out of the "fix_in_import" form returned by step A. |
 | `fix_in_import` | `true` | Literally the string `true`. |
-| `add_with_request_id` | empty | Preserve even when empty. |
+| `add_with_request_id` | empty in this 2024 capture; filled with the venue request id in the 2026-09-02 probe (§4.1) | Echo back whatever the fix form carries, empty or not. |
 
 Per-team fields (repeated for each team the server wasn't able to
 auto-match). Prefix is `team_<hexkey>_` where `<hexkey>` is a 32-char
@@ -353,7 +367,7 @@ are:
 | `_idteam` | Numeric team id the admin picked (from autocomplete / lookup). |
 | `_name` | Team name as it appears for this tournament (may differ from the canonical `name` of `idteam`). |
 | `_town` | Town **name** (string, not id — e.g. `Нюрнберг`, `Сборная`). |
-| `_action` | What to do. Observed value: `change_name_on_tournament`. Other values presumably exist (`merge`, `create_new`, ...) but were not captured. |
+| `_action` | What to do. The client sends `change_name_on_tournament`; the full radio set is listed in §4.1 (`<idteam>`, `create`, `data`, `change_name_on_tournament`, `noop`). |
 
 Response: `302`, `Location: /tournament/13114` (the admin returns to the
 clean tournament page). The follow-up `GET /tournament/13114` and `GET
@@ -448,39 +462,33 @@ discriminator.
 | Log in | POST | `/login` | form-urlencoded | — | 302 → `/` + `PHPSESSID`/`REMEMBERME` cookies |
 | Create player | POST | `/player/create` | form-urlencoded (XHR) | per-player | `{"success":true}` (no id) |
 | Create team | POST | `/teams/create` | form-urlencoded (XHR) | per-team | `[]` (no id) |
-| Upload rosters — step A | POST | `/tournaments.php?displaytournament=<id>` | multipart (`file`, `import_teams`, `add_with_request_id`) | per-tournament | 302 OR HTML with `idimport` + `team_<hex>_*` fields |
+| Upload rosters — step A | POST | `/tournaments.php?displaytournament=<id>` | multipart (`file`, `import_teams`, `add_with_request_id`) | per-tournament | always 200 with the tournament page: success flash, fix form (`idimport` + `team_<hex>_*`), `Ошибка импорта`, or nothing (silent drop) — see §4.1 |
 | Upload rosters — step B | POST | `/tournament/<id>` | form-urlencoded (`idimport`, `fix_in_import=true`, per-team fields) | per-tournament | 302 → `/tournament/<id>` |
-| Upload results | POST | `/result/submit` | multipart (`file`, `tournament_id`, `add_with_request_id`) | per-tournament | not captured (expect 302) |
+| Upload results | POST | `/result/submit` | multipart (`file`, `tournament_id`, `add_with_request_id`) | per-tournament | not captured; the client treats a non-login page without `Ошибка импорта` as success |
 | Upload positions | POST | `/tournaments.php?displaytournament=<id>` | multipart (`file`, `import_positions`, `add_with_request_id`) | per-tournament | not captured |
 
 ---
 
 ## Gaps / follow-up captures needed
 
-1. **Raw login response `Set-Cookie` header** — confirm actual session
-   cookie names (`PHPSESSID`, `REMEMBERME`) so we can assert on them rather
-   than guessing. A `curl -v -D -` against `/login` will do it.
+1. ~~Raw login response `Set-Cookie` header~~ — verified at runtime: the
+   site issues `PHPSESSID` and, with `_remember_me=on`, `REMEMBERME`; the
+   client persists both.
 2. **`create_player` / `create_team` success payload with IDs** — the HAR
    responses do not carry the new id. Capture the dropdown refresh request
    that happens right after (probably `/player/search?...` or similar) to
    see how the site looks up the fresh record.
-3. **Step A of roster upload** — the multipart `file=` POST to
-   `/tournaments.php?displaytournament=<id>` with `import_teams` was not
-   captured. Record a fresh HAR with "Preserve log" enabled so we can see
-   the exact response (302 vs 200 with fix-form) and the exact structure of
-   the fix form (to nail down the `team_<hex>_*` key scheme and the full
-   set of `_action` values beyond `change_name_on_tournament`).
+3. ~~Step A of roster upload~~ — verified live on 2026-09-02, see §4.1
+   (always 200; the fix form's field scheme and `_action` values are
+   recorded there).
 4. **Result upload response** — `upload_results.har` contains no POST at
    all. Re-capture to see the success/failure payload for `/result/submit`.
 5. **Position upload** — not captured; reconstruct from the HTML only.
 
 ---
 
-## File paths
+## Source captures
 
-- `/mnt/c/proj/chgk_local/login.har`
-- `/mnt/c/proj/chgk_local/create_player.har`
-- `/mnt/c/proj/chgk_local/create_team.har`
-- `/mnt/c/proj/chgk_local/upload_rosters.har`
-- `/mnt/c/proj/chgk_local/upload_results.har`
-- `/mnt/c/proj/chgk_local/har_notes.md` — this file.
+`login.har`, `create_player.har`, `create_team.har`, `upload_rosters.har`
+and `upload_results.har`, kept privately in the `chgk_local` project (they
+carry a live session and are not published).

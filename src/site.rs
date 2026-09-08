@@ -1,14 +1,20 @@
 //! Write-side client for `https://rating.chgk.info` — the admin website,
-//! which has no public write API. Every call here mimics a form or AJAX
-//! request the site's own pages make; `docs/har_notes.md` is the reference.
+//! using its cookie-authenticated JSON endpoints for rosters and results,
+//! and forms for login and player/team creation. See `docs/submission_api.md`
+//! for submissions and `docs/har_notes.md` for the remaining form flows.
 //!
 //! Flow: [`login`] once to obtain a [`Session`] (the cookies the site
-//! issued — never the password), persist it, and build a `reqwest::Client`
+//! issued — never the password), persist it, and build a [`SiteClient`]
 //! from it with [`Session::client`] for each write. When the site stops
-//! accepting the cookies, writes fail with [`Error::SessionExpired`]; log in
-//! again and retry.
+//! accepting the cookies, writes fail with [`Error::SessionExpired`]; log
+//! in again and retry.
+//!
+//! A serialised `Session` is a bearer credential: the `REMEMBERME` cookie
+//! stays valid for about a year. Store it with owner-only permissions and
+//! keep it out of logs (its `Debug` output redacts the cookies).
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,18 +22,26 @@ use reqwest::{Client, Url};
 use reqwest_cookie_store::{CookieStore, CookieStoreMutex};
 use serde::{Deserialize, Serialize};
 
-use crate::csv::{build_results_csv, build_rosters_csv, ResultsRoundRow, RosterRow};
+use crate::api::ApiClient;
+use crate::csv::RosterRow;
+
+mod submission;
+use crate::http::read_body;
+use crate::text::{collapse_whitespace, summarize_response};
 use crate::{Error, Result};
 
-pub const SITE: &str = "https://rating.chgk.info";
+/// Base URL of the admin website.
+pub const SITE_BASE: &str = "https://rating.chgk.info";
 
 // ---- sessions --------------------------------------------------------------
 
 /// A logged-in rating.chgk.info session: the site's cookies (`PHPSESSID`,
 /// `REMEMBERME`) serialised as JSON, plus who they belong to.
 ///
-/// Serialisable; field names are stable so callers can persist it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Serialisable; field names are stable so callers can persist it. Treat
+/// the serialised form as a password-equivalent secret.
+#[derive(Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Session {
     /// `CookieStore::save_json` output.
     pub cookies_json: String,
@@ -37,20 +51,52 @@ pub struct Session {
     /// The login name used (an e-mail address), for display.
     #[serde(default)]
     pub login: String,
-    /// Unix timestamp of the login.
+    /// Unix timestamp of the login; `0` for sessions persisted before this
+    /// field existed.
+    #[serde(default)]
     pub logged_in_at: i64,
+    /// The site the cookies belong to: [`SITE_BASE`], or the mirror / test
+    /// server given to [`login_with`]. Sessions persisted before this
+    /// field existed load as [`SITE_BASE`].
+    #[serde(default = "default_base_url")]
+    pub base_url: String,
+}
+
+fn default_base_url() -> String {
+    SITE_BASE.to_string()
+}
+
+impl fmt::Debug for Session {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Session")
+            .field("cookies_json", &"<redacted>")
+            .field("player_id", &self.player_id)
+            .field("login", &self.login)
+            .field("logged_in_at", &self.logged_in_at)
+            .field("base_url", &self.base_url)
+            .finish()
+    }
 }
 
 impl Session {
     /// Build a session from raw cookie name/value pairs (e.g. copied from a
     /// browser or produced by [`Session::cookie_header`]). The inverse of
     /// `cookie_header`; `player_id` is whatever the caller knows.
-    pub fn from_cookies(cookies: &[(&str, &str)], login: &str, player_id: Option<i64>) -> Result<Session> {
+    ///
+    /// # Errors
+    /// [`Error::Config`] if a cookie name or value is not valid cookie
+    /// syntax.
+    pub fn from_cookies(
+        cookies: &[(&str, &str)],
+        login: &str,
+        player_id: Option<i64>,
+    ) -> Result<Session> {
         let jar = Arc::new(CookieStoreMutex::new(CookieStore::default()));
         {
-            let mut store = jar.lock().map_err(|_| Error::Other("cookie jar poisoned".into()))?;
-            let url = Url::parse(SITE).expect("SITE is a valid URL");
+            let mut store = jar.lock().expect("cookie jar mutex poisoned");
+            let url = Url::parse(SITE_BASE).expect("SITE_BASE is a valid URL");
             for (name, value) in cookies {
+                validate_cookie(name, value)?;
                 store
                     .parse(&format!("{}={}; Path=/", name, value), &url)
                     .map_err(|e| Error::Parse(format!("cookie {}: {}", name, e)))?;
@@ -61,38 +107,124 @@ impl Session {
             player_id,
             login: login.to_string(),
             logged_in_at: now_unix(),
+            base_url: SITE_BASE.to_string(),
         })
     }
 
-    /// A client carrying this session's cookies, ready for write calls.
-    /// Does not verify the cookies are still accepted — use [`verify`] or
-    /// just attempt the write and handle [`Error::SessionExpired`].
-    pub fn client(&self) -> Result<Client> {
-        self.client_with_user_agent(crate::USER_AGENT)
+    fn base(&self) -> Result<Url> {
+        Url::parse(&self.base_url)
+            .map_err(|e| Error::Config(format!("session base url {:?}: {}", self.base_url, e)))
     }
 
-    pub fn client_with_user_agent(&self, user_agent: &str) -> Result<Client> {
-        build_client(jar_from_json(&self.cookies_json)?, user_agent)
+    /// A client carrying this session's cookies, ready for write calls,/// with the crate's [`USER_AGENT`](crate::USER_AGENT) and default
+    /// timeouts. Does not verify the cookies are still accepted — use
+    /// [`SiteClient::verify`] or just attempt the write and handle
+    /// [`Error::SessionExpired`].
+    ///
+    /// # Errors
+    /// [`Error::Parse`] if the stored cookies are unreadable or contain
+    /// characters that cannot go into a `Cookie` header, [`Error::Config`]
+    /// if `base_url` does not parse, [`Error::Http`] if the TLS backend
+    /// cannot be initialised.
+    pub fn client(&self) -> Result<SiteClient> {
+        self.client_with(crate::USER_AGENT)
+    }
+
+    /// [`Session::client`] with a custom `User-Agent`.
+    ///
+    /// # Errors
+    /// As [`Session::client`].
+    pub fn client_with(&self, user_agent: &str) -> Result<SiteClient> {
+        let base = self.base()?;
+        let store = self.validated_store(&base)?;
+        let jar = Arc::new(CookieStoreMutex::new(store));
+        let http = build_client(jar, user_agent, &base)?;
+        Ok(SiteClient { http, base })
+    }
+
+    /// [`Session::client`] with a custom `User-Agent`.
+    ///
+    /// # Errors
+    /// As [`Session::client`].
+    #[deprecated(since = "0.2.0", note = "renamed to `client_with`")]
+    pub fn client_with_user_agent(&self, user_agent: &str) -> Result<SiteClient> {
+        self.client_with(user_agent)
     }
 
     /// The `Cookie:` header value a browser would send to the site with
     /// these cookies — for handing the session to other tools.
+    ///
+    /// # Errors
+    /// [`Error::Parse`] if the stored cookies are unreadable or contain
+    /// characters that cannot go into a `Cookie` header.
     pub fn cookie_header(&self) -> Result<String> {
-        let store = store_from_json(&self.cookies_json)?;
-        let url = Url::parse(SITE).expect("SITE is a valid URL");
+        let base = self.base()?;
+        let store = self.validated_store(&base)?;
         let mut parts: Vec<String> = store
-            .get_request_values(&url)
+            .get_request_values(&base)
             .map(|(k, v)| format!("{}={}", k, v))
             .collect();
         parts.sort();
         Ok(parts.join("; "))
     }
+
+    /// The persisted store, after checking that every cookie it would send
+    /// to `base` is still valid header material (the file may have been
+    /// edited by hand).
+    fn validated_store(&self, base: &Url) -> Result<CookieStore> {
+        let store = store_from_json(&self.cookies_json)?;
+        for (name, value) in store.get_request_values(base) {
+            validate_cookie(name, value).map_err(|_| {
+                Error::Parse(format!("stored cookie {:?} has an invalid value", name))
+            })?;
+        }
+        Ok(store)
+    }
 }
 
-fn build_client(jar: Arc<CookieStoreMutex>, user_agent: &str) -> Result<Client> {
+/// RFC 6265 syntax: a non-empty `token` name and a `cookie-octet` value —
+/// no control characters, whitespace, separators or quotes that could
+/// smuggle attributes or header lines.
+fn validate_cookie(name: &str, value: &str) -> Result<()> {
+    const SEPARATORS: &str = "()<>@,;:\\\"/[]?={} \t";
+    let name_ok = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii() && !c.is_ascii_control() && !SEPARATORS.contains(c));
+    let value_ok = value.chars().all(|c| {
+        c.is_ascii() && !c.is_ascii_control() && !c.is_ascii_whitespace() && !"\",;\\".contains(c)
+    });
+    if !name_ok || !value_ok {
+        return Err(Error::Config(format!(
+            "cookie {:?}: invalid name or value",
+            name
+        )));
+    }
+    Ok(())
+}
+
+/// A cookie-carrying client for `base`. HTTPS-only unless `base` itself
+/// is plain `http` (a local test server); redirects are followed only
+/// within `base`'s origin, so a cross-site redirect can never replay the
+/// login form or carry the cookies elsewhere.
+fn build_client(jar: Arc<CookieStoreMutex>, user_agent: &str, base: &Url) -> Result<Client> {
+    let origin = base.origin();
+    let redirects = reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= 10 {
+            attempt.error("too many redirects")
+        } else if attempt.url().origin() == origin {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    });
     Ok(Client::builder()
         .cookie_provider(jar)
         .user_agent(user_agent)
+        .timeout(crate::REQUEST_TIMEOUT)
+        .connect_timeout(crate::CONNECT_TIMEOUT)
+        .https_only(base.scheme() == "https")
+        .redirect(redirects)
         .build()?)
 }
 
@@ -106,13 +238,9 @@ fn store_from_json(json: &str) -> Result<CookieStore> {
         .map_err(|e| Error::Parse(format!("stored cookies: {}", e)))
 }
 
-fn jar_from_json(json: &str) -> Result<Arc<CookieStoreMutex>> {
-    Ok(Arc::new(CookieStoreMutex::new(store_from_json(json)?)))
-}
-
 #[allow(deprecated)]
 fn dump_jar(jar: &Arc<CookieStoreMutex>) -> Result<String> {
-    let store = jar.lock().map_err(|_| Error::Other("cookie jar poisoned".into()))?;
+    let store = jar.lock().expect("cookie jar mutex poisoned");
     let mut buf: Vec<u8> = Vec::new();
     // `PHPSESSID` is a session cookie (no expiry); plain `save_json` would
     // drop it and leave only `REMEMBERME`, which works (the site re-creates
@@ -120,74 +248,8 @@ fn dump_jar(jar: &Arc<CookieStoreMutex>) -> Result<String> {
     // remember-me path staying enabled. Keep both.
     store
         .save_incl_expired_and_nonpersistent_json(&mut buf)
-        .map_err(|e| Error::Other(format!("could not serialise cookies: {}", e)))?;
-    String::from_utf8(buf).map_err(|e| Error::Other(format!("cookie json not UTF-8: {}", e)))
-}
-
-/// Log in and return the resulting [`Session`].
-///
-/// Three requests: `GET /login` for the CSRF token, `POST /login` with the
-/// credentials (`_remember_me=on`, so the site also issues a long-lived
-/// `REMEMBERME` cookie), then `GET /` to confirm the logout link is there
-/// and read the account's player id.
-pub async fn login(login: &str, password: &str) -> Result<Session> {
-    login_with_user_agent(login, password, crate::USER_AGENT).await
-}
-
-pub async fn login_with_user_agent(login: &str, password: &str, user_agent: &str) -> Result<Session> {
-    let jar = Arc::new(CookieStoreMutex::new(CookieStore::default()));
-    let client = build_client(jar.clone(), user_agent)?;
-
-    let html = client
-        .get(format!("{}/login", SITE))
-        .send()
-        .await?
-        .text()
-        .await?;
-    let token = extract_csrf_token(&html)
-        .ok_or_else(|| Error::LoginFailed("no _csrf_token on the login page".into()))?;
-
-    let form = [
-        ("_csrf_token", token.as_str()),
-        ("_username", login),
-        ("_password", password),
-        ("_remember_me", "on"),
-        ("go", "Вход"),
-    ];
-    client
-        .post(format!("{}/login", SITE))
-        .header("Origin", SITE)
-        .header("Referer", format!("{}/login", SITE))
-        .form(&form)
-        .send()
-        .await?;
-
-    let player_id = match verify(&client).await {
-        Ok(id) => id,
-        Err(Error::SessionExpired) => {
-            return Err(Error::LoginFailed(
-                "the site did not accept the credentials (wrong password, or a captcha)".into(),
-            ))
-        }
-        Err(e) => return Err(e),
-    };
-
-    Ok(Session {
-        cookies_json: dump_jar(&jar)?,
-        player_id,
-        login: login.to_string(),
-        logged_in_at: now_unix(),
-    })
-}
-
-/// Check that `client` is logged in: `GET /` must show the logout link.
-/// Returns the account's player id when the homepage exposes it.
-pub async fn verify(client: &Client) -> Result<Option<i64>> {
-    let home = client.get(format!("{}/", SITE)).send().await?.text().await?;
-    if !home.contains("/logout") {
-        return Err(Error::SessionExpired);
-    }
-    Ok(extract_player_id(&home))
+        .map_err(|e| Error::Parse(format!("could not serialise cookies: {}", e)))?;
+    String::from_utf8(buf).map_err(|e| Error::Parse(format!("cookie json not UTF-8: {}", e)))
 }
 
 fn now_unix() -> i64 {
@@ -197,228 +259,395 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-// ---- create player / team --------------------------------------------------
+// ---- login -----------------------------------------------------------------
 
-/// `POST /player/create`. The response carries no id — look the player up
-/// through [`crate::api::search_players`] afterwards.
-pub async fn create_player(client: &Client, surname: &str, name: &str, patronymic: &str) -> Result<()> {
-    let body = post_ajax(
-        client,
-        "/player/create",
-        &[("surname", surname), ("name", name), ("patronymic", patronymic)],
-    )
-    .await?;
-    expect_success_json("create_player", &body)
+/// Knobs for [`login_with`]. Build with [`LoginOptions::new`] and the
+/// chained setters (the struct is `#[non_exhaustive]`).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct LoginOptions {
+    /// `User-Agent` for the login requests and the resulting session.
+    pub user_agent: String,
+    /// Site base URL; [`SITE_BASE`] unless talking to a mirror or a test
+    /// server. An `http://` base sends the password in clear — only ever
+    /// use one for a local test server.
+    pub base_url: String,
+    /// Ask for the long-lived `REMEMBERME` cookie (about a year). Without
+    /// it the session lasts only as long as the site's `PHPSESSID`.
+    pub remember_me: bool,
 }
 
-/// `POST /teams/create`. `town_id` is the numeric id from
-/// [`crate::api::lookup_town_id`]. No id in the response — search for the
-/// team afterwards.
-pub async fn create_team(client: &Client, name: &str, town_id: i64) -> Result<()> {
-    let town = town_id.to_string();
-    let body = post_ajax(client, "/teams/create", &[("name", name), ("new-team-town", &town)]).await?;
-    expect_success_json("create_team", &body)
+impl Default for LoginOptions {
+    fn default() -> Self {
+        LoginOptions {
+            user_agent: crate::USER_AGENT.to_string(),
+            base_url: SITE_BASE.to_string(),
+            remember_me: true,
+        }
+    }
 }
 
-async fn post_ajax(client: &Client, path: &str, form: &[(&str, &str)]) -> Result<String> {
-    let resp = client
-        .post(format!("{}{}", SITE, path))
-        .header("Origin", SITE)
-        .header("Referer", format!("{}/", SITE))
-        .header("X-Requested-With", "XMLHttpRequest")
-        .header("Accept", "*/*")
-        .form(form)
+impl LoginOptions {
+    /// The defaults: the crate's user agent, the real site, remember-me on.
+    pub fn new() -> LoginOptions {
+        LoginOptions::default()
+    }
+
+    /// `User-Agent` for the login requests and the resulting session.
+    pub fn user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.user_agent = user_agent.into();
+        self
+    }
+
+    /// Site base URL (see the field doc for the `http://` caveat).
+    pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
+        self
+    }
+
+    /// Whether to ask for the long-lived `REMEMBERME` cookie.
+    pub fn remember_me(mut self, remember_me: bool) -> Self {
+        self.remember_me = remember_me;
+        self
+    }
+}
+
+/// Log in and return the resulting [`Session`].
+///
+/// Three requests: `GET /login` for the CSRF token, `POST /login` with the
+/// credentials (`_remember_me=on`, so the site also issues a long-lived
+/// `REMEMBERME` cookie), then `GET /` to confirm the logout link is there
+/// and read the account's player id.
+///
+/// # Errors
+/// [`Error::LoginFailed`] when the site did not accept the credentials or
+/// its login form changed; [`Error::Http`] on transport failures.
+pub async fn login(login: &str, password: &str) -> Result<Session> {
+    login_with(login, password, &LoginOptions::default()).await
+}
+
+/// [`login`] with a custom `User-Agent`.
+///
+/// # Errors
+/// As [`login`].
+#[deprecated(
+    since = "0.2.0",
+    note = "use `login_with(login, password, &LoginOptions::new().user_agent(ua))`"
+)]
+pub async fn login_with_user_agent(
+    login: &str,
+    password: &str,
+    user_agent: &str,
+) -> Result<Session> {
+    login_with(login, password, &LoginOptions::new().user_agent(user_agent)).await
+}
+
+/// [`login`] with explicit [`LoginOptions`].
+///
+/// # Errors
+/// As [`login`]; [`Error::Status`] when the site answers any of the three
+/// requests with an error status (an outage is not a wrong password);
+/// [`Error::Config`] if `opts.base_url` is not an absolute URL.
+pub async fn login_with(login: &str, password: &str, opts: &LoginOptions) -> Result<Session> {
+    let base = Url::parse(&opts.base_url)
+        .map_err(|e| Error::Config(format!("base url {:?}: {}", opts.base_url, e)))?;
+    let jar = Arc::new(CookieStoreMutex::new(CookieStore::default()));
+    let http = build_client(jar.clone(), &opts.user_agent, &base)?;
+    let site = SiteClient { http, base };
+
+    let resp = site.http.get(site.url("/login")).send().await?;
+    let (status, html) = read_body(resp).await?;
+    if !status.is_success() {
+        return Err(Error::Status {
+            status: status.as_u16(),
+            url: "/login".into(),
+            summary: summarize_response(&html),
+        });
+    }
+    let token = extract_csrf_token(&html)
+        .ok_or_else(|| Error::LoginFailed("no _csrf_token on the login page".into()))?;
+
+    let mut form = vec![
+        ("_csrf_token", token.as_str()),
+        ("_username", login),
+        ("_password", password),
+    ];
+    if opts.remember_me {
+        form.push(("_remember_me", "on"));
+    }
+    form.push(("go", "Вход"));
+    let resp = site
+        .http
+        .post(site.url("/login"))
+        .header("Origin", site.origin())
+        .header("Referer", site.url("/login"))
+        .form(&form)
         .send()
         .await?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
+    let (status, posted) = read_body(resp).await?;
+    if !status.is_success() && !status.is_redirection() && !is_login_page(&posted) {
+        return Err(Error::Status {
+            status: status.as_u16(),
+            url: "/login".into(),
+            summary: summarize_response(&posted),
+        });
+    }
+
+    let player_id = match site.verify().await {
+        Ok(id) => id,
+        Err(Error::SessionExpired) => {
+            let reason = extract_login_error(&posted).unwrap_or_else(|| {
+                "the site did not accept the credentials (wrong password, or a captcha)".into()
+            });
+            return Err(Error::LoginFailed(reason));
+        }
+        Err(e) => return Err(e),
+    };
+
+    Ok(Session {
+        cookies_json: dump_jar(&jar)?,
+        player_id,
+        login: login.to_string(),
+        logged_in_at: now_unix(),
+        base_url: opts.base_url.clone(),
+    })
+}
+
+// ---- client ----------------------------------------------------------------
+
+/// A client for the admin website, carrying a [`Session`]'s cookies.
+/// Obtained from [`Session::client`].
+#[derive(Debug, Clone)]
+pub struct SiteClient {
+    http: Client,
+    base: Url,
+}
+
+impl SiteClient {
+    /// Wrap a caller-built `reqwest::Client` (which must carry the session
+    /// cookies itself) against an arbitrary base URL — for mirrors and
+    /// local test servers.
+    ///
+    /// # Errors
+    /// [`Error::Config`] if `base` is not an absolute URL.
+    pub fn with_base_url(http: Client, base: &str) -> Result<SiteClient> {
+        let base =
+            Url::parse(base).map_err(|e| Error::Config(format!("base url {:?}: {}", base, e)))?;
+        Ok(SiteClient { http, base })
+    }
+
+    /// The underlying `reqwest::Client`.
+    pub fn http(&self) -> &Client {
+        &self.http
+    }
+
+    fn origin(&self) -> String {
+        self.base.as_str().trim_end_matches('/').to_string()
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.origin(), path)
+    }
+
+    /// Check that the session is logged in: `GET /` must show the logout
+    /// link. Returns the account's player id when the homepage exposes it.
+    ///
+    /// # Errors
+    /// [`Error::SessionExpired`] when the homepage is the login page or has
+    /// no logout link; [`Error::Status`] when the site answers with an
+    /// error status (an outage, not an expired session); [`Error::Http`].
+    pub async fn verify(&self) -> Result<Option<i64>> {
+        let resp = self.http.get(self.url("/")).send().await?;
+        let (status, home) = read_body(resp).await?;
+        if is_login_page(&home) {
+            return Err(Error::SessionExpired);
+        }
+        if !status.is_success() {
+            return Err(Error::Status {
+                status: status.as_u16(),
+                url: "/".into(),
+                summary: summarize_response(&home),
+            });
+        }
+        classify_home(&home)
+    }
+
+    // ---- create player / team --------------------------------------------
+
+    /// `POST /player/create`. The response carries no id — look the player
+    /// up through [`ApiClient::search_players`] afterwards.
+    ///
+    /// # Errors
+    /// [`Error::SessionExpired`]; [`Error::Site`] when the site reports a
+    /// problem (e.g. a duplicate); [`Error::Status`], [`Error::Http`].
+    pub async fn create_player(&self, surname: &str, name: &str, patronymic: &str) -> Result<()> {
+        let body = self
+            .post_ajax(
+                "/player/create",
+                &[
+                    ("surname", surname),
+                    ("name", name),
+                    ("patronymic", patronymic),
+                ],
+            )
+            .await?;
+        expect_success_json("create_player", &body)
+    }
+
+    /// `POST /teams/create`. `town_id` is the numeric id from
+    /// [`ApiClient::lookup_town_id`]. No id in the response — search for
+    /// the team afterwards.
+    ///
+    /// Open question: `docs/har_notes.md` §3 recorded the success body as
+    /// `[]`, while this call requires `{"success":true}` like
+    /// `create_player`. Until re-probed, a successful creation may be
+    /// reported as [`Error::Site`]; check with
+    /// [`ApiClient::search_teams`] before retrying.
+    ///
+    /// # Errors
+    /// As [`SiteClient::create_player`].
+    pub async fn create_team(&self, name: &str, town_id: i64) -> Result<()> {
+        let town = town_id.to_string();
+        let body = self
+            .post_ajax("/teams/create", &[("name", name), ("new-team-town", &town)])
+            .await?;
+        expect_success_json("create_team", &body)
+    }
+
+    async fn post_ajax(&self, path: &str, form: &[(&str, &str)]) -> Result<String> {
+        let url = self.url(path);
+        let resp = self
+            .http
+            .post(&url)
+            .header("Origin", self.origin())
+            .header("Referer", self.url("/"))
+            .header("X-Requested-With", "XMLHttpRequest")
+            .header("Accept", "*/*")
+            .form(form)
+            .send()
+            .await?;
+        let (status, body) = read_response(resp).await?;
         if is_login_page(&body) {
             return Err(Error::SessionExpired);
         }
-        return Err(Error::Status {
-            status: status.as_u16(),
-            summary: summarize_response(&body),
-        });
+        if !status.is_success() {
+            return Err(Error::Status {
+                status: status.as_u16(),
+                url: path.to_string(),
+                summary: summarize_response(&body),
+            });
+        }
+        Ok(body)
     }
-    Ok(body)
 }
 
+/// Status and body of a response; a body that cannot be read (or is too
+/// large) is an error, never an empty success.
+async fn read_response(resp: reqwest::Response) -> Result<(reqwest::StatusCode, String)> {
+    read_body(resp).await
+}
 /// The AJAX endpoints answer `{"success":true}` on success; a stale
 /// session gets the login page with HTTP 200, which must not pass.
 fn expect_success_json(what: &str, body: &str) -> Result<()> {
-    if body.contains("\"success\":true") {
-        return Ok(());
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        if v.get("success").and_then(|x| x.as_bool()) == Some(true) {
+            return Ok(());
+        }
     }
     if is_login_page(body) {
         return Err(Error::SessionExpired);
     }
-    Err(Error::Site(format!("{}: {}", what, summarize_response(body))))
+    Err(Error::site(what, summarize_response(body)))
 }
 
-// ---- roster upload ---------------------------------------------------------
+// ---- roster sanitising -----------------------------------------------------
 
-/// What [`upload_rosters`] did beyond the plain import.
+/// Details of a successful [`SiteClient::upload_rosters`] JSON save.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RosterUploadReport {
-    /// Team names that had their quotes removed before upload; see
-    /// [`sanitize_roster_rows`].
+    /// Legacy CSV sanitising changes. Always empty for JSON submissions,
+    /// which preserve quotes in team names.
     pub sanitized: Vec<SanitizedName>,
     /// Teams whose name differed from the registered one and were given
     /// the row's name as a one-off name for this tournament.
-    pub renamed_on_tournament: Vec<(i64, String)>,
+    pub renamed_on_tournament: Vec<RenamedTeam>,
+    /// Nonblocking notices returned by the server (for example, a disqualified player).
+    pub warnings: Vec<String>,
 }
 
+/// One team given a one-off name by [`SiteClient::upload_rosters`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SanitizedName {
+#[non_exhaustive]
+pub struct RenamedTeam {
+    /// The site's numeric team id.
     pub team_id: i64,
+    /// The name used for this tournament.
+    pub name: String,
+}
+
+/// One team whose name was changed by [`sanitize_roster_rows`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SanitizedName {
+    /// The site's numeric team id.
+    pub team_id: i64,
+    /// The name as given in the rows.
     pub from: String,
+    /// The name actually uploaded.
     pub to: String,
 }
 
-/// Upload rosters for a tournament (the venue representative's or an
-/// organiser's account must be logged in).
-///
-/// Two steps, as on the site: the CSV goes to the tournament page's import
-/// form; if the site answers with its "Ошибки команд" form because some
-/// row's team name differs from the registered one, that form is submitted
-/// back choosing "внести разовое название" (one-off name) for each such
-/// team. Rows are passed through [`sanitize_roster_rows`] first.
-///
-/// Errors: [`Error::SessionExpired`]; [`Error::Site`] when the site reports
-/// a problem *or* silently ignores the file (it does that for a quoted
-/// name that mismatches — see `docs/har_notes.md` §4.1).
-pub async fn upload_rosters(
-    client: &Client,
-    tournament_id: i64,
-    rows: &[RosterRow],
-) -> Result<RosterUploadReport> {
-    let (rows, sanitized) = sanitize_roster_rows(client, rows).await;
-    if rows.is_empty() {
-        return Err(Error::Site("no roster rows to upload".into()));
-    }
-    let csv = build_rosters_csv(&rows);
-    tracing::info!(
-        "upload_rosters: tournament {} — {} row(s), {} byte(s), {} name(s) sanitized",
-        tournament_id,
-        rows.len(),
-        csv.len(),
-        sanitized.len()
-    );
-
-    let part = reqwest::multipart::Part::bytes(csv.into_bytes())
-        .file_name("rosters.csv")
-        .mime_str("text/csv")
-        .map_err(|e| Error::Other(e.to_string()))?;
-    let form = reqwest::multipart::Form::new()
-        .text("add_with_request_id", "")
-        .text("import_teams", "Импортировать")
-        .part("file", part);
-
-    let resp = client
-        .post(format!("{}/tournaments.php?displaytournament={}", SITE, tournament_id))
-        .header("Origin", SITE)
-        .header("Referer", format!("{}/tournament/{}", SITE, tournament_id))
-        .multipart(form)
-        .send()
-        .await?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() && !status.is_redirection() {
-        return Err(Error::Status {
-            status: status.as_u16(),
-            summary: summarize_response(&body),
-        });
-    }
-
-    let mut report = RosterUploadReport {
-        sanitized,
-        renamed_on_tournament: Vec::new(),
-    };
-    let fix = match classify_import_response(&body) {
-        ImportOutcome::Success => return Ok(report),
-        ImportOutcome::LoginPage => return Err(Error::SessionExpired),
-        ImportOutcome::Ignored => {
-            tracing::warn!(
-                "upload_rosters: tournament {} — site returned neither confirmation nor fix form",
-                tournament_id
-            );
-            return Err(Error::Site(
-                "the site silently ignored the roster file (no confirmation, no error); \
-                 check team and player names for unusual characters"
-                    .into(),
-            ));
-        }
-        ImportOutcome::FixForm(fix) => fix,
-    };
-
-    tracing::info!(
-        "upload_rosters: tournament {} — fix form for {} team(s), idimport={}, request_id={:?}",
-        tournament_id,
-        fix.teams.len(),
-        fix.idimport,
-        fix.request_id
-    );
-    let mut pairs: Vec<(String, String)> = vec![
-        ("idimport".into(), fix.idimport),
-        ("fix_in_import".into(), "true".into()),
-        ("add_with_request_id".into(), fix.request_id),
-    ];
-    for t in &fix.teams {
-        pairs.push((format!("{}_idteam", t.key), t.idteam.clone()));
-        pairs.push((format!("{}_name", t.key), t.name.clone()));
-        pairs.push((format!("{}_town", t.key), t.town.clone()));
-        pairs.push((format!("{}_action", t.key), "change_name_on_tournament".into()));
-        if let Ok(id) = t.idteam.parse::<i64>() {
-            report.renamed_on_tournament.push((id, t.name.clone()));
-        }
-    }
-    let resp = client
-        .post(format!("{}/tournament/{}", SITE, tournament_id))
-        .header("Origin", SITE)
-        .header(
-            "Referer",
-            format!("{}/tournaments.php?displaytournament={}", SITE, tournament_id),
-        )
-        .form(&pairs)
-        .send()
-        .await?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() && !status.is_redirection() {
-        return Err(Error::Status {
-            status: status.as_u16(),
-            summary: summarize_response(&body),
-        });
-    }
-    if is_login_page(&body) {
-        return Err(Error::SessionExpired);
-    }
-    Ok(report)
-}
-
-/// Make roster rows safe for the site's importer.
+/// Make roster rows safe for the legacy CSV importer.
+/// [`SiteClient::upload_rosters`] uses JSON and does not call this helper.
 ///
 /// The importer matches a row's team by id and name; a name that differs
 /// from the registered one goes to the fix form — unless it contains a `"`
 /// character, in which case the site drops the whole file silently (in
 /// CSV and XLSX alike; a quoted name that *matches* imports fine). So for
-/// each team whose name contains `"`, the registered name is looked up and,
-/// if it differs, the quotes are removed from that team's rows. A failed
-/// lookup counts as "differs" — losing quotes beats losing the upload.
+/// each team whose name contains `"`, the registered name is looked up
+/// through `api` and, if it differs, the quotes are removed from that
+/// team's rows. See [`sanitize_roster_rows_with`] for the pure part.
+///
+/// # Errors
+/// Whatever [`ApiClient::get_team`] returns for a team that needed a
+/// lookup: nothing is guessed when the registered name is unknown.
 pub async fn sanitize_roster_rows(
-    client: &Client,
+    api: &ApiClient,
     rows: &[RosterRow],
+) -> Result<(Vec<RosterRow>, Vec<SanitizedName>)> {
+    let mut registered: BTreeMap<i64, String> = BTreeMap::new();
+    for id in teams_needing_lookup(rows) {
+        registered.insert(id, api.get_team(id).await?.name);
+    }
+    Ok(sanitize_roster_rows_with(rows, |id| {
+        registered.get(&id).cloned()
+    }))
+}
+
+/// [`sanitize_roster_rows`] with a caller-supplied lookup of the
+/// registered team name, called once per distinct team whose name contains
+/// a `"`. `None` means "unknown": the row is left untouched rather than
+/// renamed on a guess.
+pub fn sanitize_roster_rows_with(
+    rows: &[RosterRow],
+    mut registered_name: impl FnMut(i64) -> Option<String>,
 ) -> (Vec<RosterRow>, Vec<SanitizedName>) {
     let mut replacements: BTreeMap<i64, String> = BTreeMap::new();
     let mut sanitized = Vec::new();
     for r in rows {
-        if r.team_id <= 0 || !r.team_name.contains('"') || replacements.contains_key(&r.team_id) {
+        if !needs_lookup(r) || replacements.contains_key(&r.team_id) {
             continue;
         }
-        let registered = crate::api::get_team(client, r.team_id).await.map(|t| t.name);
-        let same = matches!(&registered, Ok(n) if n.trim() == r.team_name.trim());
-        if same {
+        let Some(registered) = registered_name(r.team_id) else {
+            tracing::warn!(
+                "sanitize_roster_rows: team {} name {:?} has quotes but the registered name is unknown; left as is",
+                r.team_id,
+                r.team_name
+            );
+            continue;
+        };
+        if registered.trim() == r.team_name.trim() {
             continue;
         }
         let to = r.team_name.replace('"', "");
@@ -426,7 +655,7 @@ pub async fn sanitize_roster_rows(
             "sanitize_roster_rows: team {} name {:?} has quotes and differs from registered {:?}; using {:?}",
             r.team_id,
             r.team_name,
-            registered.as_deref().unwrap_or("<lookup failed>"),
+            registered,
             to
         );
         sanitized.push(SanitizedName {
@@ -449,92 +678,47 @@ pub async fn sanitize_roster_rows(
     (out, sanitized)
 }
 
-// ---- results upload --------------------------------------------------------
+fn needs_lookup(r: &RosterRow) -> bool {
+    r.team_id > 0 && r.team_name.contains('"')
+}
 
-/// Upload results (per-team, per-round marks) via `POST /result/submit`.
-pub async fn upload_results(client: &Client, tournament_id: i64, rows: &[ResultsRoundRow]) -> Result<()> {
-    if rows.is_empty() {
-        return Err(Error::Site("no result rows to upload".into()));
+/// Distinct team ids whose rows carry a quoted name, in first-seen order.
+fn teams_needing_lookup(rows: &[RosterRow]) -> Vec<i64> {
+    let mut ids = Vec::new();
+    for r in rows {
+        if needs_lookup(r) && !ids.contains(&r.team_id) {
+            ids.push(r.team_id);
+        }
     }
-    let csv = build_results_csv(rows);
-    let part = reqwest::multipart::Part::bytes(csv.into_bytes())
-        .file_name("results.csv")
-        .mime_str("text/csv")
-        .map_err(|e| Error::Other(e.to_string()))?;
-    let form = reqwest::multipart::Form::new()
-        .text("add_with_request_id", "")
-        .text("tournament_id", tournament_id.to_string())
-        .part("file", part);
-    let resp = client
-        .post(format!("{}/result/submit", SITE))
-        .header("Origin", SITE)
-        .header("Referer", format!("{}/tournament/{}", SITE, tournament_id))
-        .multipart(form)
-        .send()
-        .await?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() && !status.is_redirection() {
-        return Err(Error::Status {
-            status: status.as_u16(),
-            summary: summarize_response(&body),
-        });
-    }
-    if is_login_page(&body) {
-        return Err(Error::SessionExpired);
-    }
-    Ok(())
+    ids
 }
 
 // ---- response classification / scraping -----------------------------------
 
-/// The three things the tournament page can come back as after an import
-/// POST (always HTTP 200), plus "not logged in".
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ImportOutcome {
-    /// `Импорт завершился успешно, ошибок не найдено!`
-    Success,
-    /// The "Ошибки команд" form: rows whose team name did not match.
-    FixForm(FixForm),
-    /// The site's login page: the session is gone.
-    LoginPage,
-    /// Plain tournament page — the importer discarded the file silently.
-    Ignored,
+/// The logged-in homepage must carry the logout link; the login page (or
+/// anything else) means the session is not accepted. Returns the player
+/// id when the page exposes it.
+fn classify_home(html: &str) -> Result<Option<i64>> {
+    if !html.contains("/logout") {
+        return Err(Error::SessionExpired);
+    }
+    Ok(extract_player_id(html))
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct FixForm {
-    pub idimport: String,
-    /// Hidden `add_with_request_id` of the fix form (the venue request the
-    /// import is attached to); empty if absent.
-    pub request_id: String,
-    pub teams: Vec<FixTeam>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct FixTeam {
-    /// `team_<hex>` field-name prefix.
-    pub key: String,
-    pub name: String,
-    pub town: String,
-    pub idteam: String,
-}
-
-pub(crate) fn classify_import_response(body: &str) -> ImportOutcome {
-    if is_login_page(body) {
-        return ImportOutcome::LoginPage;
-    }
-    if let Some(idimport) = scrape_idimport(body) {
-        return ImportOutcome::FixForm(FixForm {
-            idimport,
-            request_id: scrape_add_with_request_id(body).unwrap_or_default(),
-            teams: scrape_fix_teams(body),
-        });
-    }
-    if body.contains("Импорт завершился успешно") {
-        return ImportOutcome::Success;
-    }
-    ImportOutcome::Ignored
+/// Symfony's flash on a failed login: the text of the first
+/// `alert-danger` block on the page (any `alert` block if there is none).
+fn extract_login_error(html: &str) -> Option<String> {
+    let i = html
+        .find("class=\"alert-danger")
+        .or_else(|| html.find("class=\"alert alert-danger"))
+        .or_else(|| html.find("class=\"alert"))?;
+    let rest = &html[i..];
+    let start = rest.find('>')? + 1;
+    let inner = &rest[start..];
+    let end = inner.find("</div>").unwrap_or(inner.len());
+    let text = summarize_response(&decode_entities(&inner[..end]));
+    let text = collapse_whitespace(&text);
+    (!text.is_empty() && text != "(empty response body)").then_some(text)
 }
 
 /// The site's login form: a `_csrf_token` plus `_username` input.
@@ -543,8 +727,7 @@ pub(crate) fn is_login_page(body: &str) -> bool {
 }
 
 fn extract_csrf_token(html: &str) -> Option<String> {
-    let i = html.find("name=\"_csrf_token\"")?;
-    attr_value_after(&html[i..], "value=\"")
+    attr_value_of(html, "_csrf_token")
 }
 
 /// `<span id="rt_user_idplayer">12345</span>`
@@ -557,113 +740,84 @@ fn extract_player_id(html: &str) -> Option<i64> {
     rest[..end].trim().parse().ok()
 }
 
-fn scrape_idimport(html: &str) -> Option<String> {
-    let i = html.find("name=\"idimport\"")?;
-    attr_value_after(&html[i..], "value=\"")
+/// The `value` of the input whose `name` is `name`, entity-decoded; only
+/// looked for inside that input's own tag.
+fn attr_value_of(html: &str, name: &str) -> Option<String> {
+    let i = html.find(&format!("name=\"{}\"", name))?;
+    value_in_tag(tag_around(html, i))
 }
 
-/// First non-empty `add_with_request_id` value. The plain upload form has
-/// the input without a value; the fix form fills it in.
-fn scrape_add_with_request_id(html: &str) -> Option<String> {
-    let needle = "name=\"add_with_request_id\"";
-    let mut cursor = 0usize;
-    while let Some(i) = html[cursor..].find(needle) {
-        let abs = cursor + i + needle.len();
-        let tail = &html[abs..];
-        let tag_end = tail.find('>')?;
-        if let Some(v) = attr_value_after(&tail[..tag_end], "value=\"") {
-            let v = v.trim();
-            if !v.is_empty() {
-                return Some(v.to_string());
-            }
-        }
-        cursor = abs;
-    }
-    None
+/// The tag enclosing byte offset `at`: from the last `<` before it to the
+/// first `>` after it.
+fn tag_around(html: &str, at: usize) -> &str {
+    let start = html[..at].rfind('<').unwrap_or(0);
+    let end = html[at..].find('>').map(|e| at + e).unwrap_or(html.len());
+    &html[start..end]
 }
 
-/// One entry per `team_<hex>` group of `_idteam` / `_name` / `_town`
-/// inputs in the fix form.
-fn scrape_fix_teams(html: &str) -> Vec<FixTeam> {
-    let mut map: BTreeMap<String, FixTeam> = BTreeMap::new();
-    let mut cursor = 0usize;
-    while let Some(i) = html[cursor..].find("name=\"team_") {
-        let abs = cursor + i + "name=\"".len();
-        let after_quote = &html[abs..];
-        let Some(end) = after_quote.find('"') else { break };
-        let full_name = &after_quote[..end];
-        cursor = abs + end;
-        let Some(suffix_start) = full_name.rfind('_') else { continue };
-        let prefix = &full_name[..suffix_start];
-        let suffix = &full_name[suffix_start + 1..];
-        // Only `team_<hex>_<field>`; the page also has unrelated inputs such
-        // as `team_actions`, which would otherwise become a phantom team.
-        match prefix.strip_prefix("team_") {
-            Some(hex) if !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()) => {}
-            _ => continue,
+/// `value="…"` inside one tag (the attribute, not `data-value`),
+/// entity-decoded, control characters dropped.
+fn value_in_tag(tag: &str) -> Option<String> {
+    let mut from = 0;
+    let v = loop {
+        let i = from + tag[from..].find("value=\"")?;
+        let preceded_by_space = i == 0 || tag.as_bytes()[i - 1].is_ascii_whitespace();
+        if preceded_by_space {
+            break i;
         }
-        let Some(val) = attr_value_after(&html[cursor..], "value=\"") else { continue };
-        let entry = map.entry(prefix.to_string()).or_insert_with(|| FixTeam {
-            key: prefix.to_string(),
-            name: String::new(),
-            town: String::new(),
-            idteam: String::new(),
-        });
-        match suffix {
-            "name" => entry.name = val,
-            "town" => entry.town = val,
-            "idteam" => entry.idteam = val,
-            _ => {}
-        }
-    }
-    map.into_values().filter(|t| !t.idteam.is_empty()).collect()
-}
-
-fn attr_value_after(s: &str, marker: &str) -> Option<String> {
-    let v = s.find(marker)?;
-    let after = &s[v + marker.len()..];
+        from = i + 1;
+    };
+    let after = &tag[v + "value=\"".len()..];
     let end = after.find('"')?;
-    Some(after[..end].to_string())
+    Some(
+        decode_entities(&after[..end])
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect(),
+    )
 }
 
-/// A short human-readable extract of a response body: a JSON `error` /
-/// `message`, or the visible text of an HTML page, capped at 300 chars.
-fn summarize_response(body: &str) -> String {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        return "(empty response body)".into();
-    }
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        for key in ["error", "message"] {
-            if let Some(m) = v.get(key).and_then(|x| x.as_str()) {
-                return truncate(m, 300);
+/// Decode the entities the site emits in attribute values: the five named
+/// XML ones plus numeric references. Unknown or unterminated entities are
+/// left as they are.
+fn decode_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let Some(semi) = tail.find(';') else {
+            out.push_str(tail);
+            return out;
+        };
+        let entity = &tail[1..semi];
+        let decoded = match entity {
+            "amp" => Some('&'),
+            "quot" => Some('"'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "apos" => Some('\''),
+            _ => entity
+                .strip_prefix('#')
+                .and_then(|n| match n.strip_prefix(['x', 'X']) {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                    None => n.parse().ok(),
+                })
+                .and_then(char::from_u32),
+        };
+        match decoded {
+            Some(c) => {
+                out.push(c);
+                rest = &tail[semi + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &tail[1..];
             }
         }
     }
-    // Tags become spaces so `</p><br/>x` does not glue words together.
-    let mut out = String::new();
-    let mut in_tag = false;
-    for ch in trimmed.chars() {
-        match ch {
-            '<' => {
-                in_tag = true;
-                out.push(' ');
-            }
-            '>' => in_tag = false,
-            c if !in_tag => out.push(c),
-            _ => {}
-        }
-    }
-    let collapsed = out.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate(&collapsed, 300)
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        format!("{}…", s.chars().take(n).collect::<String>())
-    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -675,106 +829,237 @@ mod tests {
         <input type="text" name="_username"> <input type="password" name="_password">
         </form>"#;
 
-    // Trimmed from a live tournament page after a mismatching import
-    // (T14015, 2026-09-02).
-    const FIX_FORM: &str = r#"
-        <form action="/tournaments.php?displaytournament=14015" enctype="multipart/form-data" method="post">
-          <input type="hidden" name="add_with_request_id"/>
-          <input type="file" name="file"/>
-          <input type="submit" name="import_teams" value="Импортировать"/>
-        </form>
-        <form action="/tournament/14015" method="post">
-          <input type="hidden" name="idimport" value="196018"/>
-          <input type="hidden" name="fix_in_import" value="true"/>
-          <input type="hidden" name="add_with_request_id" value="189504">
-          <button id="show_teams_import_errors" type="button">Ошибки команд</button>
-          <tr class="import-error-table-row">
-            <td>Строка: 1 107740 Ладно, погнали вчетвером сегодня (Краков)
-                имя в базе: 107740 &quot;Ладно, погнали втроём сегодня&quot; (Краков)
-              <label>ID: <input type="text" name="team_000000000000081b0000000000000000_idteam" value="107740" /></label>
-              <label>Название: <input type="text" name="team_000000000000081b0000000000000000_name" value="Ладно, погнали вчетвером сегодня" /></label>
-              <label>Город: <input type="text" name="team_000000000000081b0000000000000000_town" value="Краков" /></label>
-            </td>
-            <td>
-              <input type="radio" name="team_000000000000081b0000000000000000_action"
-                value="107740" /> 107740 &quot;Ладно, погнали втроём сегодня&quot;
-              <label><input type="radio" name="team_000000000000081b0000000000000000_action" value="create" /> создать</label>
-              <label><input type="radio" name="team_000000000000081b0000000000000000_action" value="change_name_on_tournament" /> внести разовое название</label>
-              <label><input type="radio" name="team_000000000000081b0000000000000000_action" value="noop" /> ничего не делать</label>
-            </td>
-          </tr>
-          <input type="submit" value="Сохранить" />
-        </form>
-        <form action="/tournaments.php" method="post" id="action_form">
-          <input type="hidden" name="tournament_id" value="14015">
-          <input type="hidden" name="team_actions">
-          <input type="hidden" name="action">
-        </form>"#;
-
-    #[test]
-    fn classifies_success_fixform_login_and_ignored() {
-        assert_eq!(
-            classify_import_response("<div>Импорт завершился успешно, ошибок не найдено!</div>"),
-            ImportOutcome::Success
-        );
-        assert_eq!(classify_import_response(LOGIN_PAGE), ImportOutcome::LoginPage);
-        assert_eq!(
-            classify_import_response("<html><body>Чудове Чудовисько</body></html>"),
-            ImportOutcome::Ignored
-        );
-        match classify_import_response(FIX_FORM) {
-            ImportOutcome::FixForm(f) => {
-                assert_eq!(f.idimport, "196018");
-                assert_eq!(f.request_id, "189504");
-                assert_eq!(
-                    f.teams,
-                    vec![FixTeam {
-                        key: "team_000000000000081b0000000000000000".into(),
-                        name: "Ладно, погнали вчетвером сегодня".into(),
-                        town: "Краков".into(),
-                        idteam: "107740".into(),
-                    }]
-                );
-            }
-            other => panic!("expected fix form, got {:?}", other),
-        }
-    }
-
     #[test]
     fn scrapers() {
-        assert_eq!(extract_csrf_token(LOGIN_PAGE).as_deref(), Some("07cbb476b9ffcdfc.abc"));
+        assert_eq!(
+            extract_csrf_token(LOGIN_PAGE).as_deref(),
+            Some("07cbb476b9ffcdfc.abc")
+        );
         assert_eq!(
             extract_player_id(r#"<span class="no-display" id="rt_user_idplayer">127696</span>"#),
             Some(127696)
         );
         assert_eq!(extract_player_id("<p>no marker</p>"), None);
-        // A valueless input before the real one must not stop the search.
-        assert_eq!(scrape_add_with_request_id(FIX_FORM).as_deref(), Some("189504"));
+    }
+
+    #[test]
+    fn attribute_values_are_scoped_to_their_own_tag() {
+        // `value` before `name`.
         assert_eq!(
-            scrape_add_with_request_id(r#"<input type="hidden" name="add_with_request_id"/>"#),
+            attr_value_of(
+                r#"<input value="v1" name="x"><input name="y" value="v2">"#,
+                "x"
+            )
+            .as_deref(),
+            Some("v1")
+        );
+        // Valueless input must not borrow the next tag's value.
+        assert_eq!(
+            attr_value_of(r#"<input name="x"><input name="y" value="v2">"#, "x"),
             None
+        );
+        assert_eq!(
+            attr_value_of(r#"<input name="x"><input name="y" value="v2">"#, "y").as_deref(),
+            Some("v2")
+        );
+        assert_eq!(attr_value_of("<p>no such input</p>", "x"), None);
+    }
+
+    #[test]
+    fn html_entities_are_decoded() {
+        assert_eq!(
+            decode_entities("Q&amp;A &#39;26 &quot;bis&quot; &lt;x&gt; &#x41;&#65;"),
+            "Q&A '26 \"bis\" <x> AA"
+        );
+        assert_eq!(decode_entities("&unknown; &amp"), "&unknown; &amp");
+    }
+
+    #[test]
+    fn home_page_classification() {
+        assert_eq!(
+            classify_home(
+                r#"<span id="rt_user_idplayer">127696</span><a href="/logout">Выход</a>"#
+            )
+            .unwrap(),
+            Some(127696)
+        );
+        assert_eq!(
+            classify_home(r#"<a href="/logout">Выход</a>"#).unwrap(),
+            None
+        );
+        assert!(matches!(
+            classify_home(LOGIN_PAGE),
+            Err(Error::SessionExpired)
+        ));
+    }
+
+    #[test]
+    fn login_flash_is_extracted() {
+        let page = format!(
+            "<div class=\"alert alert-danger\">Неверные учётные данные.</div>{}",
+            LOGIN_PAGE
+        );
+        assert_eq!(
+            extract_login_error(&page).as_deref(),
+            Some("Неверные учётные данные.")
+        );
+        assert_eq!(extract_login_error(LOGIN_PAGE), None);
+    }
+
+    #[test]
+    fn sanitize_strips_quotes_only_when_the_name_differs_from_the_registered_one() {
+        let row = |team_id: i64, name: &str| RosterRow {
+            team_id,
+            team_name: name.into(),
+            town: "Краков".into(),
+            player_id: 1,
+            surname: "A".into(),
+            name: "B".into(),
+            patronymic: String::new(),
+            flag: None,
+        };
+        let rows = vec![
+            row(1, "\"Same\" name"),
+            row(2, "\"Other\" name"),
+            row(3, "\"Unknown\" team"),
+            row(4, "plain name"),
+            row(2, "\"Other\" name"),
+        ];
+        let mut looked_up = Vec::new();
+        let (out, sanitized) = sanitize_roster_rows_with(&rows, |id| {
+            looked_up.push(id);
+            match id {
+                1 => Some(" \"Same\" name ".to_string()),
+                2 => Some("Other name registered".to_string()),
+                _ => None,
+            }
+        });
+        assert_eq!(
+            looked_up,
+            vec![1, 2, 3],
+            "one lookup per quoted team, none for plain names"
+        );
+        let names: Vec<&str> = out.iter().map(|r| r.team_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "\"Same\" name",
+                "Other name",
+                "\"Unknown\" team",
+                "plain name",
+                "Other name"
+            ]
+        );
+        assert_eq!(
+            sanitized,
+            vec![SanitizedName {
+                team_id: 2,
+                from: "\"Other\" name".into(),
+                to: "Other name".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn session_debug_redacts_cookies_and_tolerates_old_json() {
+        let session = Session::from_cookies(&[("PHPSESSID", "secret123")], "x", None).unwrap();
+        let dbg = format!("{:?}", session);
+        assert!(!dbg.contains("secret123"), "{}", dbg);
+        assert!(dbg.contains("<redacted>"), "{}", dbg);
+        // Sessions persisted before `logged_in_at` existed still load.
+        let old: Session = serde_json::from_str(&format!(
+            r#"{{"cookies_json":{},"player_id":5}}"#,
+            serde_json::to_string(&session.cookies_json).unwrap()
+        ))
+        .unwrap();
+        assert_eq!(old.player_id, Some(5));
+        assert_eq!(old.logged_in_at, 0);
+    }
+
+    #[test]
+    fn from_cookies_rejects_separators_and_control_characters() {
+        for (name, value) in [
+            ("PHPSESSID", "a;Domain=.chgk.info"),
+            ("PHPSESSID", "a\r\nX-Injected: 1"),
+            ("PHP SESSID", "a"),
+            ("PHPSESSID", "a,b"),
+            ("", "a"),
+            ("PHPSESSID", "a\"b"),
+        ] {
+            assert!(
+                matches!(
+                    Session::from_cookies(&[(name, value)], "x", None),
+                    Err(Error::Config(_))
+                ),
+                "{:?}={:?} must be rejected",
+                name,
+                value
+            );
+        }
+        assert!(Session::from_cookies(&[("REMEMBERME", "a1b2-C3_d4%3D")], "x", None).is_ok());
+        assert!(Session::from_cookies(&[("REMEMBERME", "QUJD/ZGVm+Zz==")], "x", None).is_ok());
+    }
+
+    #[test]
+    fn cookie_header_revalidates_persisted_values() {
+        let session = Session::from_cookies(&[("PHPSESSID", "abc")], "x", None).unwrap();
+        let mut tampered = session.clone();
+        tampered.cookies_json = session
+            .cookies_json
+            .replace("abc", "abc\\r\\nX-Injected: 1");
+        assert!(
+            tampered.cookies_json.contains("X-Injected"),
+            "{}",
+            tampered.cookies_json
+        );
+        assert!(matches!(tampered.cookie_header(), Err(Error::Parse(_))));
+        assert!(matches!(tampered.client(), Err(Error::Parse(_))));
+    }
+
+    #[test]
+    fn attribute_values_drop_control_characters() {
+        assert_eq!(
+            value_in_tag(r#"<input value="a&#0;b&#x1b;c">"#).as_deref(),
+            Some("abc")
+        );
+    }
+
+    #[test]
+    fn malformed_entities_are_left_alone() {
+        assert_eq!(
+            decode_entities("&#;x &#xZZ; &#x110000; &#xD800;"),
+            "&#;x &#xZZ; &#x110000; &#xD800;"
         );
     }
 
     #[test]
     fn success_json_and_stale_session() {
         assert!(expect_success_json("x", r#"{"success":true}"#).is_ok());
+        assert!(expect_success_json("x", "{ \"success\" : true , \"id\": 1 }").is_ok());
+        assert!(matches!(
+            expect_success_json("x", r#"{"success":false}"#),
+            Err(Error::Site { .. })
+        ));
+        assert!(matches!(
+            expect_success_json("x", r#"{"data":{"success":true}}"#),
+            Err(Error::Site { .. })
+        ));
+        assert!(matches!(
+            expect_success_json("x", "<b>garbage \"success\":true</b>"),
+            Err(Error::Site { .. })
+        ));
         assert!(matches!(
             expect_success_json("x", LOGIN_PAGE),
             Err(Error::SessionExpired)
         ));
-        match expect_success_json("create_team", r#"{"error":"Такая команда уже есть"}"#) {
-            Err(Error::Site(msg)) => assert_eq!(msg, "create_team: Такая команда уже есть"),
+        match expect_success_json("create_team", r#"{"error":"Такая команда уже есть"}"#)
+        {
+            Err(Error::Site { action, message }) => {
+                assert_eq!(action, "create_team");
+                assert_eq!(message, "Такая команда уже есть");
+            }
             other => panic!("unexpected {:?}", other),
         }
-    }
-
-    #[test]
-    fn summarize_strips_html_and_truncates() {
-        assert_eq!(summarize_response("  "), "(empty response body)");
-        assert_eq!(summarize_response("<p>Ошибка   импорта</p><br/>x"), "Ошибка импорта x");
-        let long = "я".repeat(400);
-        assert_eq!(summarize_response(&long).chars().count(), 301);
     }
 
     #[test]
@@ -782,10 +1067,8 @@ mod tests {
         let jar = Arc::new(CookieStoreMutex::new(CookieStore::default()));
         {
             let mut store = jar.lock().unwrap();
-            let url = Url::parse(SITE).unwrap();
-            store
-                .parse("PHPSESSID=abc123; Path=/", &url)
-                .unwrap();
+            let url = Url::parse(SITE_BASE).unwrap();
+            store.parse("PHPSESSID=abc123; Path=/", &url).unwrap();
             store
                 .parse("REMEMBERME=tok; Path=/; Max-Age=31536000", &url)
                 .unwrap();
@@ -795,9 +1078,13 @@ mod tests {
             player_id: Some(127696),
             login: "someone@example.com".into(),
             logged_in_at: 1_700_000_000,
+            base_url: SITE_BASE.into(),
         };
         session.client().expect("client from session");
-        assert_eq!(session.cookie_header().unwrap(), "PHPSESSID=abc123; REMEMBERME=tok");
+        assert_eq!(
+            session.cookie_header().unwrap(),
+            "PHPSESSID=abc123; REMEMBERME=tok"
+        );
         // Serde round trip keeps the stable field names.
         let json = serde_json::to_string(&session).unwrap();
         assert!(json.contains("\"cookies_json\"") && json.contains("\"logged_in_at\""));
@@ -806,7 +1093,11 @@ mod tests {
 
         // from_cookies is the inverse of cookie_header.
         let imported =
-            Session::from_cookies(&[("REMEMBERME", "tok"), ("PHPSESSID", "abc123")], "x", None).unwrap();
-        assert_eq!(imported.cookie_header().unwrap(), "PHPSESSID=abc123; REMEMBERME=tok");
+            Session::from_cookies(&[("REMEMBERME", "tok"), ("PHPSESSID", "abc123")], "x", None)
+                .unwrap();
+        assert_eq!(
+            imported.cookie_header().unwrap(),
+            "PHPSESSID=abc123; REMEMBERME=tok"
+        );
     }
 }
