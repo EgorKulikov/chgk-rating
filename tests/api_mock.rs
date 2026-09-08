@@ -93,7 +93,7 @@ async fn venue_list_keeps_the_orgcommittee() {
             r#"[{"id":1,"status":"A","tournamentId":10,"dateStart":"2026-08-29T12:00:00+00:00","representative":{"id":127696,"name":"Роберт","surname":"Михайлюк"}}]"#,
         ),
         "/tournaments/10" => json(
-            r#"{"id":10,"name":"T","dateStart":"2026-08-29T12:00:00+00:00","questionQty":[12,12],"orgcommittee":[{"id":7420},{"id":8}]}"#,
+            r#"{"id":10,"name":"T","dateStart":"2026-08-29T12:00:00+00:00","questionQty":[12,12],"orgcommittee":[{"id":7420},{"id":8}],"languages":{"1":{"id":"ru","name":"Русский"}}}"#,
         ),
         _ => not_found(),
     })
@@ -106,6 +106,17 @@ async fn venue_list_keeps_the_orgcommittee() {
     assert_eq!(list[0].orgcommittee, vec![7420, 8]);
     assert_eq!(list[0].representative_id, Some(127696));
     assert_eq!(list[0].questions_per_round, vec![12, 12]);
+}
+
+#[tokio::test]
+async fn tournament_languages_accept_sparse_indexed_objects() {
+    let s = serve(|_| {
+        json(r#"{"id":13846,"name":"T","languages":{"10":{"id":"en"},"2":{"id":"uk"},"1":{"id":"ru"}}}"#)
+    })
+    .await;
+    let mut tournament = client(&s).get_tournament(13846).await.unwrap();
+    tournament.languages.sort();
+    assert_eq!(tournament.languages, vec!["en", "ru", "uk"]);
 }
 
 #[tokio::test]

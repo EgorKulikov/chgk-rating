@@ -305,7 +305,7 @@ struct ApiTournament {
     #[serde(default)]
     appeal_jury: Vec<ApiIdOnly>,
     #[serde(default)]
-    languages: Option<Vec<ApiLanguage>>,
+    languages: Option<ApiLanguages>,
     #[serde(default)]
     rating_systems: Option<Vec<String>>,
     #[serde(default)]
@@ -355,6 +355,7 @@ impl From<ApiTournament> for Tournament {
             appeal_jury: ids(t.appeal_jury),
             languages: t
                 .languages
+                .map(ApiLanguages::into_vec)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|l| l.id)
@@ -367,6 +368,23 @@ impl From<ApiTournament> for Tournament {
             hide_results_to: t.hide_results_to,
             difficulty_forecast: t.difficulty_forecast,
             regulations_url: t.regulations_url.unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ApiLanguages {
+    List(Vec<ApiLanguage>),
+    // PHP serializes arrays with gaps in their indices as JSON objects.
+    Indexed(std::collections::BTreeMap<String, ApiLanguage>),
+}
+
+impl ApiLanguages {
+    fn into_vec(self) -> Vec<ApiLanguage> {
+        match self {
+            Self::List(languages) => languages,
+            Self::Indexed(languages) => languages.into_values().collect(),
         }
     }
 }

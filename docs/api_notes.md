@@ -294,6 +294,11 @@ numerically. Number of rounds = number of entries.
 For very old tournaments (e.g. id=1, year 2003) the field is `null` /
 absent (verified 2026-09-03).
 
+`languages` can also be an array or an object with sparse numeric keys.
+Tournament 13846 returns `{"1":{"name":"Русский","id":"ru"}}`
+(verified 2026-09-08). Both shapes are accepted and preserve the language
+codes; a missing or null field produces an empty list.
+
 ### Other tournament fields seen in the wild
 
 Synch tournaments listing additionally contains: `archive`, `toursCanceled`

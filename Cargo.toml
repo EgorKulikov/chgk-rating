@@ -1,6 +1,6 @@
 [package]
 name = "chgk_rating"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Client for rating.chgk.info: the public read API and the admin website's write-side flows (login sessions, player/team creation, roster and results upload)"
 license = "MIT"
