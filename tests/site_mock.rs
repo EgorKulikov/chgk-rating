@@ -40,46 +40,134 @@ fn form_field(body: &str, name: &str) -> Option<String> {
 
 // ---- create player / team ----------------------------------------------------
 
+const PLAYERS_PATH: &str = "/api/tournaments/42/representative/players";
+const ROSTER_PATH: &str = "/api/tournaments/42/representative/roster";
+
 #[tokio::test]
-async fn create_player_accepts_json_success_with_whitespace() {
-    let s = serve(|_| json("{ \"success\" : true }")).await;
-    site(&s)
-        .create_player("Малкин", "Михаил", "")
+async fn create_player_posts_json_in_the_tournament_scope_and_returns_the_player() {
+    let s = serve(|r| match (r.method.as_str(), r.path.as_str()) {
+        ("GET", ROSTER_PATH) => json("{}"),
+        ("POST", PLAYERS_PATH) => status(
+            201,
+            r#"{"id": 300001, "surname": "Малкин", "name": "Михаил", "patronymic": null}"#,
+        ),
+        _ => status(404, "nope"),
+    })
+    .await;
+    let p = site(&s)
+        .create_player(42, "Малкин", "Михаил", "")
         .await
         .unwrap();
-    let r = &s.requests()[0];
-    assert_eq!(r.path, "/player/create");
-    assert_eq!(r.header("x-requested-with"), Some("XMLHttpRequest"));
-    assert_eq!(form_field(&r.body, "surname").as_deref(), Some("Малкин"));
+    assert_eq!(
+        (p.id, p.surname.as_str(), p.name.as_str()),
+        (300001, "Малкин", "Михаил")
+    );
+    assert_eq!(p.patronymic, "");
+    let post = s
+        .requests()
+        .into_iter()
+        .find(|r| r.method == "POST")
+        .unwrap();
+    assert_eq!(post.path, PLAYERS_PATH);
+    assert!(post
+        .header("content-type")
+        .unwrap()
+        .starts_with("application/json"));
+    let body: serde_json::Value = serde_json::from_str(&post.body).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({"surname": "Малкин", "name": "Михаил", "patronymic": ""})
+    );
 }
 
 #[tokio::test]
-async fn create_player_rejects_false_nested_and_malformed_success() {
-    for body in [
-        r#"{"success":false}"#,
-        r#"{"data":{"success":true}}"#,
-        "<html>oops</html>",
-        "",
-    ] {
-        let s = serve(move |_| json(body)).await;
-        match site(&s).create_player("A", "B", "").await {
-            Err(Error::Site { action, .. }) => assert_eq!(action, "create_player"),
-            other => panic!("body {:?}: expected Site error, got {:?}", body, other),
+async fn create_player_uses_the_admin_scope_when_the_own_scope_is_forbidden() {
+    let s = serve(|r| match (r.method.as_str(), r.path.as_str()) {
+        ("GET", ROSTER_PATH) => status(403, r#"{"error":"Access denied"}"#),
+        ("GET", "/api/tournaments/42/representative/roster?admin=1") => json("{}"),
+        ("POST", "/api/tournaments/42/representative/players?admin=1") => status(
+            201,
+            r#"{"id": 7, "surname": "A", "name": "B", "patronymic": "C"}"#,
+        ),
+        _ => status(404, "nope"),
+    })
+    .await;
+    let p = site(&s).create_player(42, "A", "B", "C").await.unwrap();
+    assert_eq!((p.id, p.patronymic.as_str()), (7, "C"));
+}
+
+#[tokio::test]
+async fn create_player_reports_the_sites_validation_error_and_a_stale_session() {
+    let s = serve(|r| match r.method.as_str() {
+        "GET" => json("{}"),
+        _ => status(422, r#"{"error":"Фамилия и имя обязательны"}"#),
+    })
+    .await;
+    match site(&s).create_player(42, "", "", "").await {
+        Err(Error::Status {
+            status, summary, ..
+        }) => {
+            assert_eq!(status, 422);
+            assert_eq!(summary, "Фамилия и имя обязательны");
         }
+        other => panic!("expected Status, got {:?}", other),
     }
+    assert!(matches!(
+        site(&s).create_player(0, "A", "B", "").await,
+        Err(Error::Site { .. })
+    ));
+
+    let s = serve(|_| html(LOGIN_PAGE)).await;
+    assert!(matches!(
+        site(&s).create_player(42, "A", "B", "").await,
+        Err(Error::SessionExpired)
+    ));
+
+    // A 2xx body without an id is not a created player.
+    let s = serve(|r| match r.method.as_str() {
+        "GET" => json("{}"),
+        _ => json(r#"{"surname":"A","name":"B"}"#),
+    })
+    .await;
+    assert!(matches!(
+        site(&s).create_player(42, "A", "B", "").await,
+        Err(Error::Parse(_))
+    ));
 }
 
 #[tokio::test]
-async fn create_team_posts_name_and_town_id() {
-    let s = serve(|_| json(r#"{"success":true}"#)).await;
-    site(&s).create_team("Q&A", 2088).await.unwrap();
+async fn create_team_posts_name_and_town_id_and_returns_the_new_id() {
+    let s = serve(|_| json(r#"{"teamId": 110234}"#)).await;
+    assert_eq!(site(&s).create_team("Q&A", 2088).await.unwrap(), 110234);
     let r = &s.requests()[0];
     assert_eq!(r.path, "/teams/create");
+    assert_eq!(r.header("x-requested-with"), Some("XMLHttpRequest"));
     assert_eq!(form_field(&r.body, "name").as_deref(), Some("Q&A"));
     assert_eq!(
         form_field(&r.body, "new-team-town").as_deref(),
         Some("2088")
     );
+    assert!(
+        form_field(&r.body, "join").is_none(),
+        "must not join the creator to the roster"
+    );
+}
+
+#[tokio::test]
+async fn create_team_without_an_id_in_the_answer_is_an_error() {
+    for body in [
+        r#"{"success":true}"#,
+        "[]",
+        r#"{"teamId": 0}"#,
+        r#"{"message":"нельзя"}"#,
+        "",
+    ] {
+        let s = serve(move |_| json(body)).await;
+        match site(&s).create_team("X", 1).await {
+            Err(Error::Site { action, .. }) => assert_eq!(action, "create_team"),
+            other => panic!("body {:?}: expected Site error, got {:?}", body, other),
+        }
+    }
 }
 
 #[tokio::test]

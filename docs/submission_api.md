@@ -1,6 +1,9 @@
 # Roster and results submission
 
-Contract checked against `idiotiqui/rating-site` commit `a7258ff6` (2026-09-08):
+Contract checked against `fjqtp/rating-site` (formerly `idiotiqui/rating-site`)
+commit `a7258ff6` (2026-09-08); route paths re-checked against `5e4f00cf`
+(2026-09-30), after `c8b769a6` moved id routes to the plural `/tournaments/{id}`
+(the singular form only redirects GET/HEAD, so a POST to it is a 404):
 `site/src/Controller/RepresentativeResultsController.php`,
 `site/src/Application/TournamentResultsQuery.php`, and
 `site/src/Application/Tournament/ResultsEntry/TeamResultsWriter.php`.
@@ -24,7 +27,7 @@ error is returned. Existing teams retain their request association.
 
 ## Rosters
 
-`POST /api/tournament/{id}/representative/roster`:
+`POST /api/tournaments/{id}/representative/roster`:
 
 ```json
 {
@@ -70,7 +73,7 @@ warnings are returned as human-readable strings in `warnings`.
 
 ## Results
 
-`GET /api/tournament/{id}/representative/results` returns the authenticated
+`GET /api/tournaments/{id}/representative/results` returns the authenticated
 scope's complete question maps, including controversial answer text:
 
 ```json
@@ -87,7 +90,7 @@ answers before converting round-local marks into absolute question numbers.
 Each supplied round must contain exactly its configured question count.
 Round numbers are one-based; duplicate team/round pairs are rejected.
 
-`POST /api/tournament/{id}/representative/results` receives:
+`POST /api/tournaments/{id}/representative/results` receives:
 
 ```json
 {
@@ -123,6 +126,23 @@ therefore sends each submitted team's full question map. The GET and POST
 are separate requests without a revision token, so another edit to the same
 team between them can be overwritten. Callers should serialize their own
 uploads. Team naming/town changes belong to roster submission, not this endpoint.
+
+## Creating a player
+
+`POST /api/tournaments/{id}/representative/players` with
+`{"surname": "…", "name": "…", "patronymic": "…"}` creates a player record
+and answers `201` with `{"id", "surname", "name", "patronymic"}`
+(`patronymic` is `null` when empty). It needs the same scope as a roster
+write — a representative's request on the tournament, or `admin=1` for
+organisers — so `SiteClient::create_player` takes the tournament id and
+resolves the scope with the same preliminary GET. Missing surname or name,
+or a field over 30 characters, is `422` with `{"error": …}`; no rights is
+`403`. The old tournament-independent `/player/create` was removed on
+2026-09-24.
+
+A sibling `…/representative/teams` (`{"name", "townId"}` → `201`
+`{"id", "name", "town"}`) exists too; the client keeps using
+`/teams/create`, which needs no tournament (see `har_notes.md` §3).
 
 ## Responses and verification
 

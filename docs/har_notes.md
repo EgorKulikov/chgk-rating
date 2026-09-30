@@ -139,7 +139,12 @@ the `_csrf_token` hidden input lives there. The Rust client must:
 
 ---
 
-## 2. Create player — `create_player.har`
+## 2. Create player — `create_player.har` (historical)
+
+> **Removed by the site on 2026-09-24** (rating-site `077a1c1a`): `/player/create`
+> no longer exists. Players are created with
+> `POST /api/tournaments/{id}/representative/players` — see
+> `docs/submission_api.md`. The capture below is kept for reference only.
 
 ### 2.1 `POST https://rating.chgk.info/player/create`
 
@@ -223,18 +228,12 @@ Fields:
 | `name` | yes | Team name, UTF-8 percent-encoded. Spaces encoded as `+`. |
 | `new-team-town` | yes | Numeric **town id** (here `449`). This is the internal CHGK town id that the public API exposes under `/towns`. |
 
-Response: `200 application/json`, body **exactly**:
-
-```
-[]
-```
-
-Same gotcha as `create_player`: the server does not return the new team id.
-
-**Unresolved:** the client (`SiteClient::create_team`) requires
-`{"success":true}` like `create_player` does, which contradicts the `[]`
-above. One of the two is stale; re-probe before relying on the error.
-Plan on a follow-up lookup (likely `api.rating.chgk.info/teams?name=...`).
+Response: `200 application/json`. In this 2024 capture the body was `[]`;
+the current controller (rating-site `TeamCreateController`, checked at
+`5e4f00cf`, 2026-09-30) answers `{"teamId": <new id>}`, and that is what
+`SiteClient::create_team` requires and returns. The optional `join=1`
+field (sent only by the site's own `/teams/new` page) also puts the creator
+into the team's base roster; the client never sends it.
 
 ---
 
@@ -460,8 +459,8 @@ discriminator.
 |---|---|---|---|---|---|
 | Get CSRF | GET | `/login` | — | — | HTML with `_csrf_token` hidden input |
 | Log in | POST | `/login` | form-urlencoded | — | 302 → `/` + `PHPSESSID`/`REMEMBERME` cookies |
-| Create player | POST | `/player/create` | form-urlencoded (XHR) | per-player | `{"success":true}` (no id) |
-| Create team | POST | `/teams/create` | form-urlencoded (XHR) | per-team | `[]` (no id) |
+| Create player | POST | `/api/tournaments/<id>/representative/players` | JSON | per-player | `201` with `{id, surname, name, patronymic}` |
+| Create team | POST | `/teams/create` | form-urlencoded (XHR) | per-team | `{"teamId": <id>}` |
 | Upload rosters — step A | POST | `/tournaments.php?displaytournament=<id>` | multipart (`file`, `import_teams`, `add_with_request_id`) | per-tournament | always 200 with the tournament page: success flash, fix form (`idimport` + `team_<hex>_*`), `Ошибка импорта`, or nothing (silent drop) — see §4.1 |
 | Upload rosters — step B | POST | `/tournament/<id>` | form-urlencoded (`idimport`, `fix_in_import=true`, per-team fields) | per-tournament | 302 → `/tournament/<id>` |
 | Upload results | POST | `/result/submit` | multipart (`file`, `tournament_id`, `add_with_request_id`) | per-tournament | not captured; the client treats a non-login page without `Ошибка импорта` as success |
@@ -474,10 +473,8 @@ discriminator.
 1. ~~Raw login response `Set-Cookie` header~~ — verified at runtime: the
    site issues `PHPSESSID` and, with `_remember_me=on`, `REMEMBERME`; the
    client persists both.
-2. **`create_player` / `create_team` success payload with IDs** — the HAR
-   responses do not carry the new id. Capture the dropdown refresh request
-   that happens right after (probably `/player/search?...` or similar) to
-   see how the site looks up the fresh record.
+2. ~~`create_player` / `create_team` success payload with IDs~~ — both
+   current endpoints return the new id (see §2 note and §3.1).
 3. ~~Step A of roster upload~~ — verified live on 2026-09-02, see §4.1
    (always 200; the fix form's field scheme and `_action` values are
    recorded there).

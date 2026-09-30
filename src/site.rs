@@ -472,46 +472,23 @@ impl SiteClient {
         classify_home(&home)
     }
 
-    // ---- create player / team --------------------------------------------
+    // ---- create team (players: see `submission`) ---------------------------
 
-    /// `POST /player/create`. The response carries no id — look the player
-    /// up through [`ApiClient::search_players`] afterwards.
+    /// `POST /teams/create`; returns the new team's id. `town_id` is the
+    /// numeric id from [`ApiClient::lookup_town_id`]. Any logged-in account
+    /// may do this; no tournament is involved, and the creator is not
+    /// added to the team's roster.
     ///
     /// # Errors
-    /// [`Error::SessionExpired`]; [`Error::Site`] when the site reports a
-    /// problem (e.g. a duplicate); [`Error::Status`], [`Error::Http`].
-    pub async fn create_player(&self, surname: &str, name: &str, patronymic: &str) -> Result<()> {
-        let body = self
-            .post_ajax(
-                "/player/create",
-                &[
-                    ("surname", surname),
-                    ("name", name),
-                    ("patronymic", patronymic),
-                ],
-            )
-            .await?;
-        expect_success_json("create_player", &body)
-    }
-
-    /// `POST /teams/create`. `town_id` is the numeric id from
-    /// [`ApiClient::lookup_town_id`]. No id in the response — search for
-    /// the team afterwards.
-    ///
-    /// Open question: `docs/har_notes.md` §3 recorded the success body as
-    /// `[]`, while this call requires `{"success":true}` like
-    /// `create_player`. Until re-probed, a successful creation may be
-    /// reported as [`Error::Site`]; check with
-    /// [`ApiClient::search_teams`] before retrying.
-    ///
-    /// # Errors
-    /// As [`SiteClient::create_player`].
-    pub async fn create_team(&self, name: &str, town_id: i64) -> Result<()> {
+    /// [`Error::SessionExpired`]; [`Error::Site`] when the answer carries
+    /// no `teamId` (the message is the site's own, if it gave one);
+    /// [`Error::Status`], [`Error::Http`].
+    pub async fn create_team(&self, name: &str, town_id: i64) -> Result<i64> {
         let town = town_id.to_string();
         let body = self
             .post_ajax("/teams/create", &[("name", name), ("new-team-town", &town)])
             .await?;
-        expect_success_json("create_team", &body)
+        created_team_id(&body)
     }
 
     async fn post_ajax(&self, path: &str, form: &[(&str, &str)]) -> Result<String> {
@@ -546,18 +523,22 @@ impl SiteClient {
 async fn read_response(resp: reqwest::Response) -> Result<(reqwest::StatusCode, String)> {
     read_body(resp).await
 }
-/// The AJAX endpoints answer `{"success":true}` on success; a stale
-/// session gets the login page with HTTP 200, which must not pass.
-fn expect_success_json(what: &str, body: &str) -> Result<()> {
+/// `/teams/create` answers `{"teamId": <id>}`; a stale session gets the
+/// login page with HTTP 200, which must not pass.
+fn created_team_id(body: &str) -> Result<i64> {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
-        if v.get("success").and_then(|x| x.as_bool()) == Some(true) {
-            return Ok(());
+        if let Some(id) = v
+            .get("teamId")
+            .and_then(|x| x.as_i64())
+            .filter(|id| *id > 0)
+        {
+            return Ok(id);
         }
     }
     if is_login_page(body) {
         return Err(Error::SessionExpired);
     }
-    Err(Error::site(what, summarize_response(body)))
+    Err(Error::site("create_team", summarize_response(body)))
 }
 
 // ---- roster sanitising -----------------------------------------------------
@@ -1033,30 +1014,28 @@ mod tests {
     }
 
     #[test]
-    fn success_json_and_stale_session() {
-        assert!(expect_success_json("x", r#"{"success":true}"#).is_ok());
-        assert!(expect_success_json("x", "{ \"success\" : true , \"id\": 1 }").is_ok());
+    fn created_team_id_needs_a_positive_team_id() {
+        assert_eq!(created_team_id(r#"{"teamId": 110234}"#).unwrap(), 110234);
+        for body in [
+            r#"{"success":true}"#,
+            "[]",
+            r#"{"teamId":"x"}"#,
+            r#"{"data":{"teamId":5}}"#,
+        ] {
+            assert!(
+                matches!(created_team_id(body), Err(Error::Site { .. })),
+                "{}",
+                body
+            );
+        }
         assert!(matches!(
-            expect_success_json("x", r#"{"success":false}"#),
-            Err(Error::Site { .. })
-        ));
-        assert!(matches!(
-            expect_success_json("x", r#"{"data":{"success":true}}"#),
-            Err(Error::Site { .. })
-        ));
-        assert!(matches!(
-            expect_success_json("x", "<b>garbage \"success\":true</b>"),
-            Err(Error::Site { .. })
-        ));
-        assert!(matches!(
-            expect_success_json("x", LOGIN_PAGE),
+            created_team_id(LOGIN_PAGE),
             Err(Error::SessionExpired)
         ));
-        match expect_success_json("create_team", r#"{"error":"Такая команда уже есть"}"#)
-        {
+        match created_team_id(r#"{"message":"Неправильные аргументы"}"#) {
             Err(Error::Site { action, message }) => {
                 assert_eq!(action, "create_team");
-                assert_eq!(message, "Такая команда уже есть");
+                assert_eq!(message, "Неправильные аргументы");
             }
             other => panic!("unexpected {:?}", other),
         }

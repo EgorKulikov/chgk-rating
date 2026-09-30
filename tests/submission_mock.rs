@@ -7,8 +7,8 @@ use common::{json, serve, status, Reply, Seen};
 use serde_json::{json as value, Value};
 use std::collections::BTreeMap;
 
-const ROSTER_PATH: &str = "/api/tournament/42/representative/roster";
-const RESULTS_PATH: &str = "/api/tournament/42/representative/results";
+const ROSTER_PATH: &str = "/api/tournaments/42/representative/roster";
+const RESULTS_PATH: &str = "/api/tournaments/42/representative/results";
 
 fn clients(s: &common::Server) -> (SiteClient, ApiClient) {
     (

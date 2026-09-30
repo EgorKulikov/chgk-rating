@@ -11,7 +11,16 @@ use time::{
 use super::{is_login_page, read_response, RenamedTeam, RosterUploadReport, SiteClient};
 use crate::csv::{Mark, ResultsRoundRow, RosterFlag, RosterRow};
 use crate::text::summarize_response;
-use crate::{ApiClient, Error, Result, SeasonMembership};
+use crate::{ApiClient, Error, Player, Result, SeasonMembership};
+
+#[derive(Deserialize)]
+struct CreatedPlayer {
+    id: i64,
+    surname: String,
+    name: String,
+    #[serde(default)]
+    patronymic: Option<String>,
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -395,6 +404,47 @@ impl SiteClient {
         Ok(report)
     }
 
+    /// Create a player through the tournament's results-entry API
+    /// (`POST /api/tournaments/{id}/representative/players`) and return
+    /// the new record, id included. The site allows this to the
+    /// tournament's representatives and organisers, which is why a
+    /// tournament id is required; the scope (own request or `admin=1`) is
+    /// resolved the same way as for roster uploads. `patronymic` may be
+    /// empty.
+    ///
+    /// # Errors
+    /// [`Error::SessionExpired`]; [`Error::Status`] when the site refuses
+    /// (403 without rights on the tournament, 422 with its validation
+    /// message in `summary`); [`Error::Site`] for a non-positive
+    /// tournament id; [`Error::Parse`] if the answer is not a player;
+    /// [`Error::Http`].
+    pub async fn create_player(
+        &self,
+        tournament_id: i64,
+        surname: &str,
+        name: &str,
+        patronymic: &str,
+    ) -> Result<Player> {
+        validate_id("create_player", "tournament", tournament_id)?;
+        let (_, admin) = self.load_submission(tournament_id, "roster").await?;
+        let response = self
+            .post_submission(
+                tournament_id,
+                "players",
+                admin,
+                &json!({"surname": surname, "name": name, "patronymic": patronymic}),
+            )
+            .await?;
+        let created: CreatedPlayer = serde_json::from_value(response)
+            .map_err(|e| Error::Parse(format!("create_player: {e}")))?;
+        Ok(Player {
+            id: created.id,
+            surname: created.surname,
+            name: created.name,
+            patronymic: created.patronymic.unwrap_or_default(),
+        })
+    }
+
     async fn load_submission(&self, tournament_id: i64, resource: &str) -> Result<(Value, bool)> {
         match self.get_submission(tournament_id, resource, false).await {
             Ok(value) => Ok((value, false)),
@@ -437,7 +487,10 @@ impl SiteClient {
             .http
             .post(self.url(&path))
             .header("Origin", self.origin())
-            .header("Referer", self.url(&format!("/tournament/{tournament_id}")))
+            .header(
+                "Referer",
+                self.url(&format!("/tournaments/{tournament_id}")),
+            )
             .header("Accept", "application/json")
             .json(payload)
             .send()
@@ -448,7 +501,7 @@ impl SiteClient {
 
 fn submission_path(tournament_id: i64, resource: &str, admin: bool) -> String {
     format!(
-        "/api/tournament/{tournament_id}/representative/{resource}{}",
+        "/api/tournaments/{tournament_id}/representative/{resource}{}",
         if admin { "?admin=1" } else { "" }
     )
 }
