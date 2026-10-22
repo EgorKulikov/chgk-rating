@@ -66,5 +66,9 @@ pub const USER_AGENT: &str = concat!(
 /// [`Session::client`].
 pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How many times [`ApiClient`] sends a request that keeps answering
+/// HTTP 429 before giving up and returning the [`Error::Status`].
+pub const RATE_LIMIT_ATTEMPTS: u32 = 4;
+
 /// Connect timeout applied by [`ApiClient::new`] and [`Session::client`].
 pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);

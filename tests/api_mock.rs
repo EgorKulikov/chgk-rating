@@ -754,3 +754,72 @@ async fn intersections_are_tournaments() {
         .unwrap();
     assert_eq!(t[0].id, 14015);
 }
+
+// ---- rate limiting -------------------------------------------------------
+//
+// The live API answers HTTP 429 under bursts (a festival refreshing a few
+// dozen base rosters back to back trips it within seconds). A 429 is
+// transient: the client waits and retries instead of failing the call.
+
+fn too_many_requests(retry_after: Option<&str>) -> Reply {
+    let r = status(429, r#"{"detail":"Too Many Requests"}"#);
+    match retry_after {
+        Some(v) => r.header("Retry-After", v),
+        None => r,
+    }
+}
+
+/// Answers `rejections` × 429 (with the given Retry-After), then the player.
+fn rate_limited_then_ok(
+    rejections: usize,
+    retry_after: Option<&'static str>,
+) -> impl Fn(&Seen) -> Reply {
+    let hits = std::sync::atomic::AtomicUsize::new(0);
+    move |_| {
+        let n = hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n < rejections {
+            too_many_requests(retry_after)
+        } else {
+            json(r#"{"id":7,"surname":"Иванов","name":"Иван","patronymic":""}"#)
+        }
+    }
+}
+
+#[tokio::test]
+async fn too_many_requests_is_retried_after_the_advertised_delay() {
+    let s = serve(rate_limited_then_ok(1, Some("1"))).await;
+    let started = std::time::Instant::now();
+    let p = client(&s).get_player(7).await.unwrap();
+    assert_eq!(p.id, 7);
+    assert_eq!(s.requests().len(), 2, "one rejection, one retry");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(1),
+        "retried after {:?}, before Retry-After elapsed",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn too_many_requests_without_retry_after_backs_off_before_retrying() {
+    let s = serve(rate_limited_then_ok(1, None)).await;
+    let started = std::time::Instant::now();
+    client(&s).get_player(7).await.unwrap();
+    assert_eq!(s.requests().len(), 2);
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(1),
+        "retried after only {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn too_many_requests_gives_up_after_bounded_retries() {
+    let s = serve(|_| too_many_requests(Some("0"))).await;
+    let err = client(&s).get_player(7).await.unwrap_err();
+    assert_eq!(err.status(), Some(429), "{:?}", err);
+    assert_eq!(
+        s.requests().len(),
+        chgk_rating::RATE_LIMIT_ATTEMPTS as usize,
+        "every attempt was a request, then the client stopped"
+    );
+}

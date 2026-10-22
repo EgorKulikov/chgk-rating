@@ -102,6 +102,18 @@ Accept: application/ld+json
 * For total count and last-page URL, request with `Accept:
   application/ld+json` and read `totalItems` / `view.last`.
 
+## Rate limiting
+
+The API answers `429 Too Many Requests` under bursts: a client fetching a
+few dozen base rosters back to back (one `/teams/{id}/seasons` call plus
+one `/players/{id}` call per member) starts seeing 429s after roughly a
+hundred requests in a couple of seconds, while a slow sequential stream
+of single requests does not trip it. `ApiClient` retries a 429 after the
+`Retry-After` the server sends (seconds; capped at 30 s), or 1 s / 2 s /
+4 s when there is none, giving up after `RATE_LIMIT_ATTEMPTS` attempts
+with the `Error::Status`. Callers that refresh many teams should still
+pace themselves between teams.
+
 ## Ordering
 
 Default order is ascending primary key (`id`). The `order[...]`

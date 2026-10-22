@@ -28,6 +28,8 @@
 use reqwest::{Client, Url};
 use serde::Deserialize;
 
+use std::time::Duration;
+
 use crate::http::read_body;
 use crate::models::{
     Appeal, Controversial, ControversialVerdict, Country, Language, Player, PlayerTournament,
@@ -39,6 +41,19 @@ use crate::{Error, Result};
 
 /// Base URL of the public API.
 pub const API_BASE: &str = "https://api.rating.chgk.info";
+
+/// How long to wait before re-sending a request the API answered with
+/// HTTP 429: the server's `Retry-After` (in seconds) when it sends one,
+/// otherwise 1 s, 2 s, 4 s… per `attempt`; never more than 30 s.
+fn retry_delay(retry_after: Option<&reqwest::header::HeaderValue>, attempt: u32) -> Duration {
+    const CAP: Duration = Duration::from_secs(30);
+    retry_after
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(1u64 << (attempt - 1).min(5)))
+        .min(CAP)
+}
 
 /// Client for the public read-only API.
 #[derive(Debug, Clone)]
@@ -100,20 +115,40 @@ impl ApiClient {
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<T> {
-        let resp = self.http.get(self.url(path)).query(query).send().await?;
-        let url = resp.url().path_and_query_string();
-        let (status, body) = read_body(resp).await.map_err(|e| match e {
-            Error::Parse(m) => Error::Parse(format!("{}: {}", url, m)),
-            other => other,
-        })?;
-        if !status.is_success() {
-            return Err(Error::Status {
-                status: status.as_u16(),
-                url,
-                summary: summarize_response(&body),
-            });
+        let mut attempt = 1;
+        loop {
+            let resp = self.http.get(self.url(path)).query(query).send().await?;
+            let url = resp.url().path_and_query_string();
+            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+                && attempt < crate::RATE_LIMIT_ATTEMPTS
+            {
+                let delay = retry_delay(resp.headers().get(reqwest::header::RETRY_AFTER), attempt);
+                tracing::warn!(
+                    "{}: HTTP 429, retrying in {:?} (attempt {} of {})",
+                    url,
+                    delay,
+                    attempt,
+                    crate::RATE_LIMIT_ATTEMPTS
+                );
+                drop(resp);
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+                continue;
+            }
+            let (status, body) = read_body(resp).await.map_err(|e| match e {
+                Error::Parse(m) => Error::Parse(format!("{}: {}", url, m)),
+                other => other,
+            })?;
+            if !status.is_success() {
+                return Err(Error::Status {
+                    status: status.as_u16(),
+                    url,
+                    summary: summarize_response(&body),
+                });
+            }
+            return serde_json::from_str(&body)
+                .map_err(|e| Error::Parse(format!("{}: {}", url, e)));
         }
-        serde_json::from_str(&body).map_err(|e| Error::Parse(format!("{}: {}", url, e)))
     }
 
     /// Every row of a paginated collection, 100 per page. A failed page is

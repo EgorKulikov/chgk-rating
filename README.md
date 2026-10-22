@@ -11,6 +11,8 @@ site of the "Что? Где? Когда?" community.
   languages, venue types, team flags). Every anonymous read endpoint of the
   official spec is wrapped except the user table and a few by-id variants
   of reference lists; see the coverage table in `docs/api_notes.md`.
+  Requests the API rejects with HTTP 429 are retried after the advertised
+  `Retry-After` (or a short backoff), up to `RATE_LIMIT_ATTEMPTS` times.
 - `site` — write flows using the website's cookie-authenticated JSON API
   for roster/results submission and forms for login and player/team creation.
   Log in to a persistent `Session` (the site's
